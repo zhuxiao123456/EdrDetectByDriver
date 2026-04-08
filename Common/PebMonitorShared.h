@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #ifndef PEBMONITOR_KERNEL_SHARED
 #include <windows.h>
