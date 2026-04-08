@@ -1,47 +1,124 @@
 #pragma once
+#include <mutex>
+#include <regex>
 #include <string>
 #include <vector>
+#include "Shared.h"
 
-// ===========================================================================
-// 检测规则结构体
-// ===========================================================================
-struct DetectionRule {
-	std::wstring id;
-	std::wstring threatDesc;
-	int severity;
-	std::vector<std::wstring> parentProcessKeywords; // position: 1
-	std::vector<std::wstring> childProcessKeywords;  // position: 2
-	std::vector<std::wstring> cmdLineKeywords;       // position: 3
-	std::vector<std::wstring> parentCmdLineKeywords; // position: 4
+struct RuleRegexGroup {
+    bool enabled = false;
+    std::vector<std::wstring> patternTexts;
+    std::vector<std::wregex> patterns;
 };
 
-// ===========================================================================
-// 规则管理与匹配引擎类
-// ===========================================================================
+struct DetectionRule {
+    std::wstring id;
+    std::wstring threatDesc;
+    int severity = 0;
+    RuleRegexGroup parentProcessRules;  // position: 1
+    RuleRegexGroup childProcessRules;   // position: 2
+    RuleRegexGroup cmdLineRules;        // position: 3
+    RuleRegexGroup parentCmdLineRules;  // position: 4
+};
+
+struct RegistryRuleField {
+    bool enabled = false;
+    ULONG matchType = REGISTRY_MATCH_TYPE_EXACT;
+    std::vector<std::wstring> values;
+};
+
+struct RegistryRuleDefinition {
+    std::wstring id;
+    std::wstring threatDesc;
+    int severity = 0;
+    ULONG operation = REGISTRY_OPERATION_SET_VALUE;
+    RegistryRuleField processNameRule;
+    RegistryRuleField keyPathRule;
+    RegistryRuleField infoClassRule;
+    RegistryRuleField valueNameRule;
+    RegistryRuleField valueDataRule;
+};
+
+struct FileRuleDefinition {
+    std::wstring id;
+    std::wstring threatDesc;
+    int severity = 0;
+    ULONG operation = FILE_OPERATION_CREATE_OR_WRITE;
+    RegistryRuleField processNameRule;
+    RegistryRuleField targetPathRule;
+    RegistryRuleField extensionRule;
+};
+
+struct RuleConfiguration {
+    std::wstring sourcePath;
+    std::wstring configVersion;
+    std::wstring profileName;
+    std::wstring generatedAt;
+    std::vector<DetectionRule> processRules;
+    std::vector<DetectionRule> processAllowRules;
+    std::vector<std::wstring> driverBlacklist;
+    std::vector<FileRuleDefinition> fileRuleDefinitions;
+    std::vector<FILE_RULE> fileRules;
+    std::vector<RegistryRuleDefinition> registryRuleDefinitions;
+    std::vector<REGISTRY_RULE> registryRules;
+    std::vector<RegistryRuleDefinition> registryAllowRuleDefinitions;
+    std::vector<REGISTRY_RULE> registryAllowRules;
+};
+
 class RuleManager {
 public:
-	RuleManager();
-	~RuleManager();
+    RuleManager();
+    ~RuleManager();
 
-	// 从 JSON 文件加载规则
-	bool LoadRulesFromJson(const std::wstring& jsonFilePath);
+    bool LoadRulesFromJson(const std::wstring& jsonFilePath);
+    bool TryLoadRulesFromJson(
+        const std::wstring& jsonFilePath,
+        RuleConfiguration& outConfig,
+        std::wstring* outError = nullptr) const;
+    void ApplyLoadedRules(RuleConfiguration&& loadedConfig);
+    RuleConfiguration GetRuleConfigurationSnapshot() const;
 
-	// 匹配进程事件是否命中规则
-	// [修复 4]：补充 parentCmdLine 参数
-	bool EvaluateProcessAgainstRules(
-		const std::wstring& parentName,
-		const std::wstring& childName,
-		const std::wstring& cmdLine,
-		const std::wstring& parentCmdLine,
-		DetectionRule& outMatchedRule
-	);
+    bool EvaluateProcessAgainstRules(
+        const std::wstring& parentName,
+        const std::wstring& childName,
+        const std::wstring& cmdLine,
+        const std::wstring& parentCmdLine,
+        DetectionRule& outMatchedRule
+    );
+    bool TryMatchProcessAllowRule(
+        const std::wstring& parentName,
+        const std::wstring& childName,
+        const std::wstring& cmdLine,
+        const std::wstring& parentCmdLine,
+        DetectionRule& outMatchedRule
+    ) const;
 
-	// 获取当前加载的规则数量
-	size_t GetRuleCount() const;
+    size_t GetRuleCount() const;
+    size_t GetProcessAllowRuleCount() const;
+    size_t GetRegistryRuleCount() const;
+    size_t GetRegistryAllowRuleCount() const;
+    size_t GetDriverBlacklistCount() const;
+    size_t GetFileRuleCount() const;
+    std::vector<std::wstring> GetDriverBlacklist() const;
+    std::vector<FILE_RULE> GetFileRules() const;
+    std::vector<REGISTRY_RULE> GetRegistryRules() const;
+    std::vector<REGISTRY_RULE> GetRegistryAllowRules() const;
+    std::wstring GetConfigVersion() const;
+    std::wstring GetProfileName() const;
+    bool TryGetFileRuleMetadata(
+        const std::wstring& ruleId,
+        std::wstring& outThreatDesc,
+        int& outSeverity
+    ) const;
+    bool TryGetRegistryRuleMetadata(
+        const std::wstring& ruleId,
+        std::wstring& outThreatDesc,
+        int& outSeverity
+    ) const;
 
 private:
-	std::vector<DetectionRule> m_Rules; // 内部维护的规则库
+    mutable std::mutex m_Lock;
+    RuleConfiguration m_ActiveConfig;
 
-	// 内部辅助函数：UTF-8 转 std::wstring
-	std::wstring Utf8ToWString(const std::string& utf8Str);
+    std::wstring Utf8ToWString(const std::string& utf8Str);
 };
