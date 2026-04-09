@@ -1,43 +1,4 @@
-#pragma once
-
-// ===========================================================================
-// ×¢Òâ£ºµ±Ç°Õâ·Ý Shared.h ÊÇ¡¾Çý¶¯¶Ë×¨ÓÃ°æ¡¿£¡
-// Èç¹ûÄãÒª°ÑÕâ¸öÎÄ¼þ¸´ÖÆ¸øÓÃ»§Ì¬µÄ detect.exe ÏîÄ¿Ê¹ÓÃ£¬
-// ÇëÎñ±Ø½«ÏÂÃæµÄ #include <ntifs.h> Ìæ»»Îª£º
-// #include <windows.h> 
-// #include <winioctl.h>
-// ===========================================================================
-#include <ntifs.h>
-
-#define MAX_RULE_LENGTH 256
-
-// IOCTL ¶¨Òå
-#define PEB_MONITOR_DEVICE 0x8000
-#define IOCTL_GET_PROCESS_EVENT  CTL_CODE(PEB_MONITOR_DEVICE, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_SEND_VERDICT       CTL_CODE(PEB_MONITOR_DEVICE, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_GET_DRIVER_EVENT   CTL_CODE(PEB_MONITOR_DEVICE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_ADD_DRIVER_RULE    CTL_CODE(PEB_MONITOR_DEVICE, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_CLEAR_DRIVER_RULES CTL_CODE(PEB_MONITOR_DEVICE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-// ½ø³ÌÊÂ¼þ½á¹¹
-typedef struct _PROCESS_EVENT {
-	ULONG ProcessId;
-	ULONG ParentProcessId;
-	WCHAR CommandLine[1024];
-} PROCESS_EVENT, *PPROCESS_EVENT;
-
-// ½ø³ÌÀ¹½ØÅÐ¾ö
-typedef struct _PROCESS_VERDICT {
-	ULONG ProcessId;
-	BOOLEAN BlockProcess;
-} PROCESS_VERDICT, *PPROCESS_VERDICT;
-
-// Çý¶¯À¹½ØÊÂ¼þ½á¹¹
-typedef struct _DRIVER_EVENT {
-	WCHAR ImagePath[512];
-} DRIVER_EVENT, *PDRIVER_EVENT;
-
-// ºÚÃûµ¥¹æÔò½á¹¹
-typedef struct _BLACKLIST_RULE {
-	WCHAR DriverName[MAX_RULE_LENGTH];
-} BLACKLIST_RULE, *PBLACKLIST_RULE;
+ï»¿#pragma once
+#define PEBMONITOR_KERNEL_SHARED
+#include "..\Common\PebMonitorShared.h"
+#undef PEBMONITOR_KERNEL_SHARED
