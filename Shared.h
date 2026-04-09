@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #define PEBMONITOR_KERNEL_SHARED
-#include "Common\\PebMonitorShared.h"
+#include "..\Common\PebMonitorShared.h"
 #undef PEBMONITOR_KERNEL_SHARED

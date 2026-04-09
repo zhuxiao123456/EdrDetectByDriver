@@ -1,99 +1,44 @@
-﻿#include "PebMonitor.h"
-
-static LONGLONG ProcessEventTimeoutTicks() {
-    return (LONGLONG)PROCESS_EVENT_TIMEOUT_SECONDS * 10 * 1000 * 1000;
-}
+#include "PebMonitor.h"
 
 static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) {
     RtlZeroMemory(runtimeStatus, sizeof(DRIVER_RUNTIME_STATUS));
 
-    KIRQL oldIrql;
-
-    KeAcquireSpinLock(&g_RuntimeStatusLock, &oldIrql);
+    AcquireSharedPushLock(&g_RuntimeStatusLock);
     runtimeStatus->StatusFlags = g_RuntimeStatusFlags;
+    runtimeStatus->ProcessVerdictRequestCount = g_ProcessVerdictRequestCount;
+    runtimeStatus->ProcessVerdictTimeoutCount = g_ProcessVerdictTimeoutCount;
+    runtimeStatus->ProcessPortConnectCount = g_ProcessPortConnectCount;
+    runtimeStatus->ProcessPortDisconnectCount = g_ProcessPortDisconnectCount;
+    runtimeStatus->LastProcessPortConnectTime = g_LastProcessPortConnectTime;
+    runtimeStatus->LastProcessPortDisconnectTime = g_LastProcessPortDisconnectTime;
+    runtimeStatus->LastProcessVerdictTimeoutTime = g_LastProcessVerdictTimeoutTime;
+    runtimeStatus->ProcessVerdictTimeoutMs = g_ProcessVerdictTimeoutMs;
+    runtimeStatus->ProcessVerdictFailMode = g_ProcessVerdictFailMode;
     RtlStringCchCopyW(runtimeStatus->ConfigVersion, RTL_NUMBER_OF(runtimeStatus->ConfigVersion), g_ActiveConfigVersion);
     RtlStringCchCopyW(runtimeStatus->ProfileName, RTL_NUMBER_OF(runtimeStatus->ProfileName), g_ActiveProfileName);
     RtlStringCchCopyW(runtimeStatus->GeneratedAt, RTL_NUMBER_OF(runtimeStatus->GeneratedAt), g_ActiveGeneratedAt);
-    KeReleaseSpinLock(&g_RuntimeStatusLock, oldIrql);
+    ReleaseSharedPushLock(&g_RuntimeStatusLock);
 
-    KeAcquireSpinLock(&g_BlacklistLock, &oldIrql);
+    AcquireSharedPushLock(&g_BlacklistLock);
     runtimeStatus->DriverBlacklistCount = g_BlacklistCount;
-    KeReleaseSpinLock(&g_BlacklistLock, oldIrql);
+    ReleaseSharedPushLock(&g_BlacklistLock);
 
-    KeAcquireSpinLock(&g_FileRuleLock, &oldIrql);
+    AcquireSharedPushLock(&g_FileRuleLock);
     runtimeStatus->FileRuleCount = g_FileRuleCount;
-    KeReleaseSpinLock(&g_FileRuleLock, oldIrql);
+    ReleaseSharedPushLock(&g_FileRuleLock);
 
-    KeAcquireSpinLock(&g_RegistryRuleLock, &oldIrql);
+    AcquireSharedPushLock(&g_RegistryRuleLock);
     runtimeStatus->RegistryRuleCount = g_RegistryRuleCount;
-    KeReleaseSpinLock(&g_RegistryRuleLock, oldIrql);
+    ReleaseSharedPushLock(&g_RegistryRuleLock);
 
-    KeAcquireSpinLock(&g_RegistryAllowRuleLock, &oldIrql);
+    AcquireSharedPushLock(&g_RegistryAllowRuleLock);
     runtimeStatus->RegistryAllowRuleCount = g_RegistryAllowRuleCount;
-    KeReleaseSpinLock(&g_RegistryAllowRuleLock, oldIrql);
+    ReleaseSharedPushLock(&g_RegistryAllowRuleLock);
 
-    KeAcquireSpinLock(&g_QueueLock, &oldIrql);
-    runtimeStatus->ProcessEventQueueCount = g_EventCount;
-    KeReleaseSpinLock(&g_QueueLock, oldIrql);
-
+    KIRQL oldIrql;
     KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);
     runtimeStatus->DriverEventQueueCount = g_DriverEventCount;
     KeReleaseSpinLock(&g_DriverQueueLock, oldIrql);
-}
-
-static VOID PurgeExpiredProcessEventsLocked(_In_ LARGE_INTEGER now) {
-    PLIST_ENTRY entry = g_EventQueue.Flink;
-    while (entry != &g_EventQueue) {
-        PLIST_ENTRY nextEntry = entry->Flink;
-        PPROCESS_EVENT_NODE node = CONTAINING_RECORD(entry, PROCESS_EVENT_NODE, ListEntry);
-        if (node->IsSentToUser &&
-            node->SentTime.QuadPart != 0 &&
-            now.QuadPart - node->SentTime.QuadPart >= ProcessEventTimeoutTicks()) {
-            RemoveEntryList(entry);
-            g_EventCount--;
-            ExFreePoolWithTag(node, 'ndPM');
-        }
-        entry = nextEntry;
-    }
-}
-
-VOID PurgeExpiredProcessEvents() {
-    LARGE_INTEGER now;
-    KeQuerySystemTime(&now);
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&g_QueueLock, &oldIrql);
-    PurgeExpiredProcessEventsLocked(now);
-    KeReleaseSpinLock(&g_QueueLock, oldIrql);
-}
-
-VOID CleanupProcessEventsForFileObject(_In_opt_ PFILE_OBJECT FileObject) {
-    if (FileObject == NULL) {
-        return;
-    }
-
-    KIRQL oldIrql;
-    KeAcquireSpinLock(&g_QueueLock, &oldIrql);
-
-    PLIST_ENTRY entry = g_EventQueue.Flink;
-    while (entry != &g_EventQueue) {
-        PLIST_ENTRY nextEntry = entry->Flink;
-        PPROCESS_EVENT_NODE node = CONTAINING_RECORD(entry, PROCESS_EVENT_NODE, ListEntry);
-        if (node->IsSentToUser && node->OwnerFileObject == FileObject) {
-            RemoveEntryList(entry);
-            g_EventCount--;
-            ExFreePoolWithTag(node, 'ndPM');
-        }
-        entry = nextEntry;
-    }
-
-    KeReleaseSpinLock(&g_QueueLock, oldIrql);
-}
-
-VOID MarkProcessEventDelivered(_Inout_ PPROCESS_EVENT_NODE Node, _In_opt_ PFILE_OBJECT FileObject) {
-    Node->IsSentToUser = TRUE;
-    Node->OwnerFileObject = FileObject;
-    KeQuerySystemTime(&Node->SentTime);
 }
 
 VOID CancelPendingDriverIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -107,24 +52,8 @@ VOID CancelPendingDriverIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
 }
 
-VOID CancelPendingEventIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
-    UNREFERENCED_PARAMETER(DeviceObject);
-    IoReleaseCancelSpinLock(Irp->CancelIrql);
-    PIRP irpToCancel = (PIRP)InterlockedCompareExchangePointer((PVOID*)&g_PendingEventIrp, NULL, Irp);
-    if (irpToCancel != NULL) {
-        irpToCancel->IoStatus.Status = STATUS_CANCELLED;
-        irpToCancel->IoStatus.Information = 0;
-        IoCompleteRequest(irpToCancel, IO_NO_INCREMENT);
-    }
-}
-
 NTSTATUS DispatchCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     UNREFERENCED_PARAMETER(DeviceObject);
-
-    PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-    if (irpSp->MajorFunction == IRP_MJ_CLOSE) {
-        CleanupProcessEventsForFileObject(irpSp->FileObject);
-    }
 
     Irp->IoStatus.Status = STATUS_SUCCESS;
     Irp->IoStatus.Information = 0;
@@ -167,117 +96,39 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         configInfo->ProfileName[MAX_RULE_LENGTH - 1] = L'\0';
         configInfo->GeneratedAt[MAX_RULE_LENGTH - 1] = L'\0';
 
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_RuntimeStatusLock, &oldIrql);
+        ULONG timeoutMs = configInfo->ProcessVerdictTimeoutMs;
+        if (timeoutMs < PROCESS_VERDICT_TIMEOUT_MS_MIN ||
+            timeoutMs > PROCESS_VERDICT_TIMEOUT_MS_MAX) {
+            timeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
+        }
+
+        ULONG failMode = configInfo->ProcessVerdictFailMode;
+        if (failMode != PROCESS_VERDICT_FAIL_OPEN &&
+            failMode != PROCESS_VERDICT_FAIL_CLOSE) {
+            failMode = PROCESS_VERDICT_FAIL_OPEN;
+        }
+
+        AcquireExclusivePushLock(&g_RuntimeStatusLock);
         RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
         RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
         RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
+        g_ProcessVerdictTimeoutMs = timeoutMs;
+        g_ProcessVerdictFailMode = failMode;
         RtlStringCchCopyW(g_ActiveConfigVersion, RTL_NUMBER_OF(g_ActiveConfigVersion), configInfo->ConfigVersion);
         RtlStringCchCopyW(g_ActiveProfileName, RTL_NUMBER_OF(g_ActiveProfileName), configInfo->ProfileName);
         RtlStringCchCopyW(g_ActiveGeneratedAt, RTL_NUMBER_OF(g_ActiveGeneratedAt), configInfo->GeneratedAt);
-        KeReleaseSpinLock(&g_RuntimeStatusLock, oldIrql);
+        ReleaseExclusivePushLock(&g_RuntimeStatusLock);
 
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
     }
 
-    case IOCTL_GET_PROCESS_EVENT: {
-        if (outBufLength < sizeof(PROCESS_EVENT)) { status = STATUS_BUFFER_TOO_SMALL; break; }
-
-        PurgeExpiredProcessEvents();
-
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_QueueLock, &oldIrql);
-
-        PLIST_ENTRY entry = g_EventQueue.Flink;
-        PPROCESS_EVENT_NODE pendingNode = NULL;
-        while (entry != &g_EventQueue) {
-            PPROCESS_EVENT_NODE node = CONTAINING_RECORD(entry, PROCESS_EVENT_NODE, ListEntry);
-            if (!node->IsSentToUser) { pendingNode = node; break; }
-            entry = entry->Flink;
-        }
-
-        if (pendingNode) {
-            MarkProcessEventDelivered(pendingNode, irpSp->FileObject);
-            PROCESS_EVENT tempEvent = pendingNode->EventData;
-            KeReleaseSpinLock(&g_QueueLock, oldIrql);
-
-            RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &tempEvent, sizeof(PROCESS_EVENT));
-            Irp->IoStatus.Information = sizeof(PROCESS_EVENT);
-            status = STATUS_SUCCESS;
-        }
-        else {
-            KeReleaseSpinLock(&g_QueueLock, oldIrql);
-
-            IoMarkIrpPending(Irp);
-            PIRP oldIrp = (PIRP)InterlockedExchangePointer((PVOID*)&g_PendingEventIrp, Irp);
-
-            if (oldIrp != NULL) {
-                if (IoSetCancelRoutine(oldIrp, NULL) != NULL) {
-                    oldIrp->IoStatus.Status = STATUS_CANCELLED;
-                    oldIrp->IoStatus.Information = 0;
-                    IoCompleteRequest(oldIrp, IO_NO_INCREMENT);
-                }
-            }
-
-            IoSetCancelRoutine(Irp, CancelPendingEventIrp);
-            if (Irp->Cancel) {
-                if (IoSetCancelRoutine(Irp, NULL) != NULL) {
-                    PIRP irpToCancel = (PIRP)InterlockedCompareExchangePointer((PVOID*)&g_PendingEventIrp, NULL, Irp);
-                    if (irpToCancel != NULL) {
-                        irpToCancel->IoStatus.Status = STATUS_CANCELLED;
-                        irpToCancel->IoStatus.Information = 0;
-                        IoCompleteRequest(irpToCancel, IO_NO_INCREMENT);
-                    }
-                }
-            }
-            return STATUS_PENDING;
-        }
-        break;
-    }
-
-    case IOCTL_SEND_VERDICT: {
-        if (inBufLength < sizeof(PROCESS_VERDICT)) { status = STATUS_BUFFER_TOO_SMALL; break; }
-        PPROCESS_VERDICT verdict = (PPROCESS_VERDICT)Irp->AssociatedIrp.SystemBuffer;
-
-        if (verdict->BlockProcess) {
-            HANDLE hProcess = NULL;
-            OBJECT_ATTRIBUTES objAttr;
-            CLIENT_ID clientId;
-
-            InitializeObjectAttributes(&objAttr, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
-            clientId.UniqueProcess = ULongToHandle(verdict->ProcessId);
-            clientId.UniqueThread = NULL;
-
-            if (NT_SUCCESS(ZwOpenProcess(&hProcess, PROCESS_TERMINATE, &objAttr, &clientId))) {
-                ZwTerminateProcess(hProcess, STATUS_ACCESS_DENIED);
-                ZwClose(hProcess);
-                KdPrint(("[EDR] 异步防御生效! 成功斩首恶意进程 PID: %d\n", verdict->ProcessId));
-            }
-        }
-
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_QueueLock, &oldIrql);
-        PLIST_ENTRY entry = g_EventQueue.Flink;
-        while (entry != &g_EventQueue) {
-            PPROCESS_EVENT_NODE node = CONTAINING_RECORD(entry, PROCESS_EVENT_NODE, ListEntry);
-            if (node->EventData.ProcessId == verdict->ProcessId && node->IsSentToUser) {
-                RemoveEntryList(entry);
-                g_EventCount--;
-                ExFreePoolWithTag(node, 'ndPM');
-                break;
-            }
-            entry = entry->Flink;
-        }
-        KeReleaseSpinLock(&g_QueueLock, oldIrql);
-
-        status = STATUS_SUCCESS;
-        break;
-    }
-
     case IOCTL_GET_DRIVER_EVENT: {
-        if (outBufLength < sizeof(DRIVER_EVENT)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        if (outBufLength < sizeof(DRIVER_EVENT)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
         KIRQL oldIrql;
         KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);
 
@@ -288,7 +139,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             DRIVER_EVENT tempEvent = node->EventData;
             KeReleaseSpinLock(&g_DriverQueueLock, oldIrql);
 
-            ExFreePoolWithTag(node, 'drPM');
+            FreeDriverEventNode(node);
             RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &tempEvent, sizeof(DRIVER_EVENT));
             Irp->IoStatus.Information = sizeof(DRIVER_EVENT);
             status = STATUS_SUCCESS;
@@ -324,44 +175,44 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     }
 
     case IOCTL_ADD_DRIVER_RULE: {
-        if (inBufLength < sizeof(BLACKLIST_RULE)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        if (inBufLength < sizeof(BLACKLIST_RULE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
         PBLACKLIST_RULE rule = (PBLACKLIST_RULE)Irp->AssociatedIrp.SystemBuffer;
 
         rule->DriverName[MAX_RULE_LENGTH - 1] = L'\0';
 
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_BlacklistLock, &oldIrql);
-
+        AcquireExclusivePushLock(&g_BlacklistLock);
         if (g_BlacklistCount < MAX_BLACKLIST_ENTRIES) {
-            size_t lenBytes = (wcslen(rule->DriverName) + 1) * sizeof(WCHAR);
-            if (lenBytes > sizeof(g_DriverBlacklist[g_BlacklistCount])) {
-                lenBytes = sizeof(g_DriverBlacklist[g_BlacklistCount]);
+            status = InsertDriverBlacklistRuleLocked(rule->DriverName);
+            if (NT_SUCCESS(status)) {
+                g_BlacklistCount++;
             }
-            RtlCopyMemory(g_DriverBlacklist[g_BlacklistCount], rule->DriverName, lenBytes);
-            g_DriverBlacklist[g_BlacklistCount][MAX_RULE_LENGTH - 1] = L'\0';
-            g_BlacklistCount++;
-            status = STATUS_SUCCESS;
         }
-        else { status = STATUS_INSUFFICIENT_RESOURCES; }
-
-        KeReleaseSpinLock(&g_BlacklistLock, oldIrql);
+        else {
+            status = STATUS_INSUFFICIENT_RESOURCES;
+        }
+        ReleaseExclusivePushLock(&g_BlacklistLock);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_DRIVER_RULES: {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_BlacklistLock, &oldIrql);
+        AcquireExclusivePushLock(&g_BlacklistLock);
+        ClearDriverBlacklistRulesLocked();
         g_BlacklistCount = 0;
-        RtlZeroMemory(g_DriverBlacklist, sizeof(g_DriverBlacklist));
-        KeReleaseSpinLock(&g_BlacklistLock, oldIrql);
+        ReleaseExclusivePushLock(&g_BlacklistLock);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_ADD_FILE_RULE: {
-        if (inBufLength < sizeof(FILE_RULE)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        if (inBufLength < sizeof(FILE_RULE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
         PFILE_RULE rule = (PFILE_RULE)Irp->AssociatedIrp.SystemBuffer;
 
         rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
@@ -369,9 +220,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         rule->TargetPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
         rule->Extension[MAX_RULE_LENGTH - 1] = L'\0';
 
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_FileRuleLock, &oldIrql);
-
+        AcquireExclusivePushLock(&g_FileRuleLock);
         if (g_FileRuleCount < MAX_FILE_RULE_COUNT) {
             RtlCopyMemory(&g_FileRules[g_FileRuleCount], rule, sizeof(FILE_RULE));
             g_FileRuleCount++;
@@ -380,25 +229,26 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         else {
             status = STATUS_INSUFFICIENT_RESOURCES;
         }
-
-        KeReleaseSpinLock(&g_FileRuleLock, oldIrql);
+        ReleaseExclusivePushLock(&g_FileRuleLock);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_FILE_RULES: {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_FileRuleLock, &oldIrql);
+        AcquireExclusivePushLock(&g_FileRuleLock);
         g_FileRuleCount = 0;
         RtlZeroMemory(g_FileRules, sizeof(g_FileRules));
-        KeReleaseSpinLock(&g_FileRuleLock, oldIrql);
+        ReleaseExclusivePushLock(&g_FileRuleLock);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_ADD_REGISTRY_RULE: {
-        if (inBufLength < sizeof(REGISTRY_RULE)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        if (inBufLength < sizeof(REGISTRY_RULE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
         PREGISTRY_RULE rule = (PREGISTRY_RULE)Irp->AssociatedIrp.SystemBuffer;
 
         rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
@@ -408,9 +258,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         rule->ValueName[MAX_RULE_LENGTH - 1] = L'\0';
         rule->ValueData[MAX_RULE_LENGTH - 1] = L'\0';
 
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_RegistryRuleLock, &oldIrql);
-
+        AcquireExclusivePushLock(&g_RegistryRuleLock);
         if (g_RegistryRuleCount < MAX_REGISTRY_RULE_COUNT) {
             RtlCopyMemory(&g_RegistryRules[g_RegistryRuleCount], rule, sizeof(REGISTRY_RULE));
             g_RegistryRuleCount++;
@@ -419,25 +267,26 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         else {
             status = STATUS_INSUFFICIENT_RESOURCES;
         }
-
-        KeReleaseSpinLock(&g_RegistryRuleLock, oldIrql);
+        ReleaseExclusivePushLock(&g_RegistryRuleLock);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_REGISTRY_RULES: {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_RegistryRuleLock, &oldIrql);
+        AcquireExclusivePushLock(&g_RegistryRuleLock);
         g_RegistryRuleCount = 0;
         RtlZeroMemory(g_RegistryRules, sizeof(g_RegistryRules));
-        KeReleaseSpinLock(&g_RegistryRuleLock, oldIrql);
+        ReleaseExclusivePushLock(&g_RegistryRuleLock);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_ADD_REGISTRY_ALLOW_RULE: {
-        if (inBufLength < sizeof(REGISTRY_RULE)) { status = STATUS_BUFFER_TOO_SMALL; break; }
+        if (inBufLength < sizeof(REGISTRY_RULE)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
         PREGISTRY_RULE rule = (PREGISTRY_RULE)Irp->AssociatedIrp.SystemBuffer;
 
         rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
@@ -447,9 +296,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         rule->ValueName[MAX_RULE_LENGTH - 1] = L'\0';
         rule->ValueData[MAX_RULE_LENGTH - 1] = L'\0';
 
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_RegistryAllowRuleLock, &oldIrql);
-
+        AcquireExclusivePushLock(&g_RegistryAllowRuleLock);
         if (g_RegistryAllowRuleCount < MAX_REGISTRY_RULE_COUNT) {
             RtlCopyMemory(&g_RegistryAllowRules[g_RegistryAllowRuleCount], rule, sizeof(REGISTRY_RULE));
             g_RegistryAllowRuleCount++;
@@ -458,18 +305,16 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         else {
             status = STATUS_INSUFFICIENT_RESOURCES;
         }
-
-        KeReleaseSpinLock(&g_RegistryAllowRuleLock, oldIrql);
+        ReleaseExclusivePushLock(&g_RegistryAllowRuleLock);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_REGISTRY_ALLOW_RULES: {
-        KIRQL oldIrql;
-        KeAcquireSpinLock(&g_RegistryAllowRuleLock, &oldIrql);
+        AcquireExclusivePushLock(&g_RegistryAllowRuleLock);
         g_RegistryAllowRuleCount = 0;
         RtlZeroMemory(g_RegistryAllowRules, sizeof(g_RegistryAllowRules));
-        KeReleaseSpinLock(&g_RegistryAllowRuleLock, oldIrql);
+        ReleaseExclusivePushLock(&g_RegistryAllowRuleLock);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
