@@ -1,0 +1,109 @@
+{
+  "config_version": "test-registry-interop-2026.04.07",
+  "profile_name": "registry_interop_test",
+  "generated_at": "2026-04-07T14:10:00.000+08:00",
+  "process_rules": [],
+  "driver_blacklist": [],
+  "registry_rules": [
+    {
+      "id": "reg-test-create-key",
+      "threat_desc": "block test create key",
+      "severity": 8,
+      "operation": "create_key",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": ["\\software\\hostguardinterop\\createkeyblocked"]
+      }
+    },
+    {
+      "id": "reg-test-set-value",
+      "threat_desc": "block test set value",
+      "severity": 8,
+      "operation": "set_value",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": ["\\software\\hostguardinterop\\setvaluetarget"]
+      },
+      "value_name": {
+        "match_type": "exact",
+        "values": ["DangerValue"]
+      }
+    },
+    {
+      "id": "reg-test-delete-value",
+      "threat_desc": "block test delete value",
+      "severity": 8,
+      "operation": "delete_value",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": ["\\software\\hostguardinterop\\deletevaluetarget"]
+      },
+      "value_name": {
+        "match_type": "exact",
+        "values": ["DangerValue"]
+      }
+    },
+    {
+      "id": "reg-test-delete-key",
+      "threat_desc": "block test delete key",
+      "severity": 8,
+      "operation": "delete_key",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": ["\\software\\hostguardinterop\\deletekeytarget"]
+      }
+    },
+    {
+      "id": "reg-test-rename-key",
+      "threat_desc": "block test rename key",
+      "severity": 8,
+      "operation": "rename_key",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": ["\\software\\hostguardinterop\\renamesource"]
+      },
+      "new_name": {
+        "match_type": "exact",
+        "values": ["RenameBlocked"]
+      }
+    },
+    {
+      "id": "reg-test-set-information-key",
+      "threat_desc": "block test set information key",
+      "severity": 9,
+      "operation": "set_information_key",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": ["\\software\\hostguardinterop\\setinformationtarget"]
+      },
+      "info_class": {
+        "match_type": "exact",
+        "values": ["KeyWriteTimeInformation"]
+      }
+    }
+  ]
+}
