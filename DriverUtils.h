@@ -47,4 +47,6 @@ bool SetActiveDriverConfigInfo(
     HANDLE hDevice,
     const std::wstring& configVersion,
     const std::wstring& profileName,
-    const std::wstring& generatedAt);
+    const std::wstring& generatedAt,
+    ULONG processVerdictTimeoutMs,
+    ULONG processVerdictFailMode);

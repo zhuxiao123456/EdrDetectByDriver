@@ -54,6 +54,8 @@ struct RuleConfiguration {
     std::wstring configVersion;
     std::wstring profileName;
     std::wstring generatedAt;
+    ULONG processVerdictTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
+    ULONG processVerdictFailMode = PROCESS_VERDICT_FAIL_OPEN;
     std::vector<DetectionRule> processRules;
     std::vector<DetectionRule> processAllowRules;
     std::vector<std::wstring> driverBlacklist;

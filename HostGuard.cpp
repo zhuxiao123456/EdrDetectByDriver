@@ -1,4 +1,5 @@
 ﻿#include <windows.h>
+#include <fltuser.h>
 #include <iostream>
 #include <atomic>
 #include <mutex>
@@ -28,9 +29,20 @@ namespace {
     HANDLE g_ShutdownCompleteEvent = NULL;
     std::atomic<void*> g_MainDeviceHandle{ INVALID_HANDLE_VALUE };
     std::atomic<void*> g_DriverEventDeviceHandle{ INVALID_HANDLE_VALUE };
+    std::atomic<void*> g_ProcessPortHandle{ INVALID_HANDLE_VALUE };
     SERVICE_STATUS_HANDLE g_ServiceStatusHandle = NULL;
     SERVICE_STATUS g_ServiceStatus = {};
     bool g_IsServiceMode = false;
+
+    struct ProcessPortMessageBuffer {
+        FILTER_MESSAGE_HEADER header;
+        PROCESS_PORT_REQUEST request;
+    };
+
+    struct ProcessPortReplyBuffer {
+        FILTER_REPLY_HEADER header;
+        PROCESS_PORT_REPLY reply;
+    };
 
     struct ProcessCacheEntry {
         std::wstring processName;
@@ -99,6 +111,13 @@ namespace {
         HANDLE driverEventHandle = reinterpret_cast<HANDLE>(g_DriverEventDeviceHandle.load(std::memory_order_acquire));
         if (IsTrackedHandleValid(driverEventHandle) && driverEventHandle != mainDeviceHandle) {
             CancelIoEx(driverEventHandle, NULL);
+        }
+
+        HANDLE processPortHandle = reinterpret_cast<HANDLE>(g_ProcessPortHandle.load(std::memory_order_acquire));
+        if (IsTrackedHandleValid(processPortHandle) &&
+            processPortHandle != mainDeviceHandle &&
+            processPortHandle != driverEventHandle) {
+            CancelIoEx(processPortHandle, NULL);
         }
     }
 
@@ -254,6 +273,10 @@ namespace {
         return description;
     }
 
+    std::wstring ProcessVerdictFailModeToString(ULONG failMode) {
+        return (failMode == PROCESS_VERDICT_FAIL_CLOSE) ? L"fail_close" : L"fail_open";
+    }
+
     bool HasConfigIdentityChanged(const RuleConfiguration& previousConfig, const RuleConfiguration& newConfig) {
         return previousConfig.profileName != newConfig.profileName ||
             previousConfig.configVersion != newConfig.configVersion ||
@@ -279,6 +302,9 @@ namespace {
         if (!config.sourcePath.empty()) {
             event[keyPrefix + "rules_path"] = WStringToUtf8(config.sourcePath);
         }
+        event[keyPrefix + "process_verdict_timeout_ms"] = config.processVerdictTimeoutMs;
+        event[keyPrefix + "process_verdict_fail_mode"] =
+            WStringToUtf8(ProcessVerdictFailModeToString(config.processVerdictFailMode));
     }
 
     void LogConfigSummary(const RuleConfiguration& config) {
@@ -301,7 +327,42 @@ namespace {
             L" 条, 文件规则 " + std::to_wstring(config.fileRuleDefinitions.size()) +
             L" 条, 注册表规则 " + std::to_wstring(config.registryRuleDefinitions.size()) +
             L" 条, 注册表白名单 " + std::to_wstring(config.registryAllowRuleDefinitions.size()) +
-            L" 条, 驱动黑名单 " + std::to_wstring(config.driverBlacklist.size()) + L" 条。");
+            L" 条, 驱动黑名单 " + std::to_wstring(config.driverBlacklist.size()) +
+            L" 条, 进程裁决超时 " + std::to_wstring(config.processVerdictTimeoutMs) +
+            L"ms, 超时策略 " + ProcessVerdictFailModeToString(config.processVerdictFailMode) + L"。");
+    }
+
+    std::wstring FormatDriverSystemTimeValue(ULONGLONG rawTime) {
+        if (rawTime == 0) {
+            return L"<never>";
+        }
+
+        FILETIME fileTime = {};
+        fileTime.dwLowDateTime = static_cast<DWORD>(rawTime & 0xFFFFFFFFULL);
+        fileTime.dwHighDateTime = static_cast<DWORD>(rawTime >> 32);
+
+        SYSTEMTIME utcTime = {};
+        SYSTEMTIME localTime = {};
+        if (!FileTimeToSystemTime(&fileTime, &utcTime)) {
+            return L"<invalid>";
+        }
+
+        if (!SystemTimeToTzSpecificLocalTime(NULL, &utcTime, &localTime)) {
+            localTime = utcTime;
+        }
+
+        wchar_t buffer[64] = {};
+        swprintf_s(
+            buffer,
+            RTL_NUMBER_OF(buffer),
+            L"%04u-%02u-%02u %02u:%02u:%02u",
+            localTime.wYear,
+            localTime.wMonth,
+            localTime.wDay,
+            localTime.wHour,
+            localTime.wMinute,
+            localTime.wSecond);
+        return std::wstring(buffer);
     }
 
     void LogDriverStatusSnapshot(const DRIVER_RUNTIME_STATUS& status) {
@@ -321,6 +382,9 @@ namespace {
         if (status.StatusFlags & DRIVER_STATUS_FLAG_FILE_FILTER_READY) {
             flagsText += L"file_filter ";
         }
+        if (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) {
+            flagsText += L"process_port ";
+        }
         if (flagsText.empty()) {
             flagsText = L"<none>";
         }
@@ -331,8 +395,24 @@ namespace {
             L", 文件规则=" + std::to_wstring(status.FileRuleCount) +
             L", 注册表拦截规则=" + std::to_wstring(status.RegistryRuleCount) +
             L", 注册表白名单规则=" + std::to_wstring(status.RegistryAllowRuleCount) +
-            L", 进程事件队列=" + std::to_wstring(status.ProcessEventQueueCount) +
             L", 驱动事件队列=" + std::to_wstring(status.DriverEventQueueCount));
+
+        LogMessage(
+            L"[+] 进程裁决链路: connected=" +
+            std::wstring((status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) ? L"yes" : L"no") +
+            L", 请求=" + std::to_wstring(status.ProcessVerdictRequestCount) +
+            L", 超时=" + std::to_wstring(status.ProcessVerdictTimeoutCount) +
+            L", 端口连接=" + std::to_wstring(status.ProcessPortConnectCount) +
+            L", 端口断开=" + std::to_wstring(status.ProcessPortDisconnectCount));
+
+        LogMessage(
+            L"[+] 进程裁决策略: timeout=" + std::to_wstring(status.ProcessVerdictTimeoutMs) +
+            L"ms, fail_mode=" + ProcessVerdictFailModeToString(status.ProcessVerdictFailMode));
+
+        LogMessage(
+            L"[+] 进程裁决时间点: 最近连接=" + FormatDriverSystemTimeValue(status.LastProcessPortConnectTime) +
+            L", 最近断开=" + FormatDriverSystemTimeValue(status.LastProcessPortDisconnectTime) +
+            L", 最近超时=" + FormatDriverSystemTimeValue(status.LastProcessVerdictTimeoutTime));
 
         if (status.ConfigVersion[0] != L'\0' || status.ProfileName[0] != L'\0') {
             LogMessage(
@@ -372,6 +452,27 @@ namespace {
 
     void EmitJsonEvent(const json& event) {
         AppendJsonLogLine(event.dump(-1, ' ', true));
+    }
+
+    std::wstring ToLowerCopy(const std::wstring& value) {
+        std::wstring lowered = value;
+        std::transform(
+            lowered.begin(),
+            lowered.end(),
+            lowered.begin(),
+            [](wchar_t ch) { return static_cast<wchar_t>(towlower(static_cast<wint_t>(ch))); });
+        return lowered;
+    }
+
+    std::wstring ExtractProcessNameFromImagePath(const std::wstring& imagePath) {
+        if (imagePath.empty()) {
+            return L"";
+        }
+
+        size_t offset = imagePath.find_last_of(L"\\/");
+        std::wstring fileName =
+            (offset == std::wstring::npos) ? imagePath : imagePath.substr(offset + 1);
+        return ToLowerCopy(fileName);
     }
 
     void PruneProcessCacheLocked(ULONGLONG nowTick) {
@@ -459,6 +560,33 @@ static std::wstring FindLocalDriverPath() {
 static HANDLE OpenDriverDevice() {
     return CreateFileW(L"\\\\.\\PebMonitor", GENERIC_READ | GENERIC_WRITE,
         0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+static bool IsPortOperationCancelled(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
+        hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
+}
+
+static bool IsProcessReplyExpired(HRESULT hr) {
+    return hr == HRESULT_FROM_WIN32(ERROR_FLT_NO_WAITER_FOR_REPLY) ||
+        hr == HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+static std::wstring FormatHResult(HRESULT hr) {
+    wchar_t buffer[32] = {};
+    swprintf_s(buffer, RTL_NUMBER_OF(buffer), L"0x%08X", static_cast<unsigned int>(hr));
+    return std::wstring(buffer);
+}
+
+static HRESULT ConnectProcessVerdictPort(HANDLE& hPort) {
+    hPort = INVALID_HANDLE_VALUE;
+    return FilterConnectCommunicationPort(
+        PEBMONITOR_PROCESS_PORT_NAME,
+        0,
+        NULL,
+        0,
+        NULL,
+        &hPort);
 }
 
 static std::wstring GetCurrentExePath() {
@@ -672,7 +800,13 @@ static bool ApplyRegistryRules(HANDLE hDevice, const RuleConfiguration& config) 
 }
 
 static bool SyncDriverConfigInfo(HANDLE hDevice, const RuleConfiguration& config) {
-    if (!SetActiveDriverConfigInfo(hDevice, config.configVersion, config.profileName, config.generatedAt)) {
+    if (!SetActiveDriverConfigInfo(
+        hDevice,
+        config.configVersion,
+        config.profileName,
+        config.generatedAt,
+        config.processVerdictTimeoutMs,
+        config.processVerdictFailMode)) {
         LogMessage(L"[!] 警告：驱动配置版本同步失败。");
         return false;
     }
@@ -806,35 +940,6 @@ static bool ReloadRulesFromDisk(
     return true;
 }
 
-static bool ReconnectMainDevice(HANDLE& hDevice) {
-    CloseTrackedHandle(hDevice, g_MainDeviceHandle);
-
-    for (int attempt = 1; attempt <= 5; ++attempt) {
-        if (WaitForShutdown(1000)) {
-            return false;
-        }
-
-        hDevice = OpenDriverDevice();
-        if (hDevice != INVALID_HANDLE_VALUE) {
-            TrackDeviceHandle(g_MainDeviceHandle, hDevice);
-            LogMessage(L"[+] 驱动通信已恢复，重新下发配置中的内核拦截规则。");
-            if (ApplyKernelRules(hDevice)) {
-                return true;
-            }
-
-            LogMessage(L"[!] 驱动已重连，但内核规则重新同步失败，将继续重试。");
-            CloseTrackedHandle(hDevice, g_MainDeviceHandle);
-        }
-    }
-
-    if (IsShutdownRequested()) {
-        return false;
-    }
-
-    LogMessage(L"[-] 多次尝试后仍无法重新连接驱动设备。程序将退出。");
-    return false;
-}
-
 void RulesHotReloadThread(std::wstring rulesPath) {
     FileState lastState;
     QueryFileState(rulesPath, lastState);
@@ -869,6 +974,228 @@ void RulesHotReloadThread(std::wstring rulesPath) {
         else {
             LogMessage(L"[!] rules.json 热更新失败，继续保留旧配置。");
         }
+    }
+}
+
+void ProcessVerdictMonitorThread() {
+    bool firstConnection = true;
+
+    while (!IsShutdownRequested()) {
+        HANDLE hProcessPort = INVALID_HANDLE_VALUE;
+        HRESULT connectHr = ConnectProcessVerdictPort(hProcessPort);
+        if (FAILED(connectHr)) {
+            if (!IsShutdownRequested()) {
+                LogMessage(L"[-] 进程裁决通信端口连接失败，1 秒后重试。HRESULT=" + FormatHResult(connectHr));
+            }
+            if (WaitForShutdown(1000)) {
+                break;
+            }
+            continue;
+        }
+
+        TrackDeviceHandle(g_ProcessPortHandle, hProcessPort);
+        if (firstConnection) {
+            LogMessage(L"[+] 进程裁决通信端口已连接，开始同步处理进程创建请求。");
+            firstConnection = false;
+        }
+        else {
+            RuleConfiguration activeConfig = g_RuleManager.GetRuleConfigurationSnapshot();
+            if (ApplyKernelRulesWithFreshHandle(activeConfig)) {
+                LogMessage(L"[+] 进程裁决端口重连成功，已重新同步当前内核规则。");
+            }
+            else {
+                LogMessage(L"[!] 进程裁决端口已重连，但重新同步当前内核规则失败。");
+            }
+        }
+
+        while (!IsShutdownRequested()) {
+            ProcessPortMessageBuffer message = {};
+            HRESULT getHr = FilterGetMessage(
+                hProcessPort,
+                &message.header,
+                static_cast<DWORD>(sizeof(message)),
+                NULL);
+
+            if (FAILED(getHr)) {
+                if (!IsShutdownRequested() && !IsPortOperationCancelled(getHr)) {
+                    LogMessage(L"[!] 进程裁决通信端口异常断开，HRESULT=" + FormatHResult(getHr));
+                }
+                break;
+            }
+
+            std::wstring parentImagePath(message.request.ParentImagePath);
+            std::wstring childImagePath(message.request.ImagePath);
+            std::wstring parentName = ExtractProcessNameFromImagePath(parentImagePath);
+            std::wstring childName = ExtractProcessNameFromImagePath(childImagePath);
+            std::wstring cmdLine(message.request.CommandLine);
+            std::wstring parentCmdLine(message.request.ParentCommandLine);
+            if (childName.empty()) {
+                childName = GetCachedProcessName(message.request.ProcessId);
+            }
+            if (parentName.empty()) {
+                parentName = GetCachedProcessName(message.request.ParentProcessId);
+            }
+            if (childName.empty()) {
+                childName = L"<unknown>";
+            }
+            if (parentName.empty()) {
+                parentName = L"<unknown>";
+            }
+
+            CacheProcessContext(message.request.ProcessId, childName, cmdLine);
+            CacheProcessContext(message.request.ParentProcessId, parentName, parentCmdLine);
+
+            if (parentCmdLine.empty()) {
+                parentCmdLine = GetCachedProcessCommandLine(message.request.ParentProcessId);
+            }
+
+            ProcessPortReplyBuffer reply = {};
+            reply.header.MessageId = message.header.MessageId;
+            reply.reply.Version = PROCESS_PORT_PROTOCOL_VERSION;
+            reply.reply.BlockProcess = 0;
+
+            DetectionRule matchedAllowRule;
+            DetectionRule matchedRule;
+            bool allowMatched = g_RuleManager.TryMatchProcessAllowRule(parentName, childName, cmdLine, parentCmdLine, matchedAllowRule);
+            bool blockMatched = false;
+            if (!allowMatched) {
+                blockMatched = g_RuleManager.EvaluateProcessAgainstRules(parentName, childName, cmdLine, parentCmdLine, matchedRule);
+                if (blockMatched) {
+                    reply.reply.BlockProcess = 1;
+                }
+            }
+
+            HRESULT replyHr = FilterReplyMessage(
+                hProcessPort,
+                &reply.header,
+                static_cast<DWORD>(sizeof(reply)));
+            if (FAILED(replyHr)) {
+                if (IsShutdownRequested() && IsPortOperationCancelled(replyHr)) {
+                    break;
+                }
+
+                if (IsProcessReplyExpired(replyHr)) {
+                    LogMessage(L"[*] 进程裁决已过期，驱动已按超时策略继续执行。EventId=" +
+                        std::to_wstring(message.request.EventId) +
+                        L", PID=" +
+                        std::to_wstring(message.request.ProcessId));
+
+                    json expiredEvent = BuildBaseJsonEvent("process_verdict_expired", "info");
+                    expiredEvent["event_id"] = message.request.EventId;
+                    expiredEvent["process_id"] = message.request.ProcessId;
+                    expiredEvent["create_time"] = message.request.CreateTime;
+                    expiredEvent["parent_name"] = WStringToUtf8(parentName);
+                    expiredEvent["child_name"] = WStringToUtf8(childName);
+                    expiredEvent["command_line"] = WStringToUtf8(cmdLine);
+                    if (!parentCmdLine.empty()) {
+                        expiredEvent["parent_command_line"] = WStringToUtf8(parentCmdLine);
+                    }
+                    if (!parentImagePath.empty()) {
+                        expiredEvent["parent_image_path"] = WStringToUtf8(parentImagePath);
+                    }
+                    if (!childImagePath.empty()) {
+                        expiredEvent["child_image_path"] = WStringToUtf8(childImagePath);
+                    }
+                    expiredEvent["file_open_name_available"] =
+                        (message.request.Flags & PROCESS_PORT_REQUEST_FLAG_FILE_OPEN_NAME_AVAILABLE) != 0;
+                    expiredEvent["intended_action"] = reply.reply.BlockProcess != 0 ? "block" : "allow";
+                    if (blockMatched) {
+                        expiredEvent["rule_id"] = WStringToUtf8(matchedRule.id);
+                        expiredEvent["severity"] = matchedRule.severity;
+                    }
+                    EmitJsonEvent(expiredEvent);
+                    continue;
+                }
+
+                LogMessage(L"[!] 向驱动发送进程判决失败，HRESULT=" + FormatHResult(replyHr));
+                break;
+            }
+
+            if (allowMatched) {
+                LogMessage(L"[+] 命中进程白名单，跳过拦截。");
+                LogMessage(L"    └─ 白名单 ID: " + matchedAllowRule.id);
+                LogMessage(L"    └─ EventId: " + std::to_wstring(message.request.EventId));
+                LogMessage(L"    └─ 父进程名: " + parentName);
+                LogMessage(L"    └─ 子进程名: " + childName);
+                if (!parentImagePath.empty()) {
+                    LogMessage(L"    └─ 父进程路径: " + parentImagePath);
+                }
+                if (!childImagePath.empty()) {
+                    LogMessage(L"    └─ 子进程路径: " + childImagePath);
+                }
+                if (!parentCmdLine.empty()) {
+                    LogMessage(L"    └─ 父进程命令行: " + parentCmdLine);
+                }
+                LogMessage(L"    └─ 命令行: " + cmdLine);
+
+                json allowEvent = BuildBaseJsonEvent("process_allow", "info");
+                allowEvent["event_id"] = message.request.EventId;
+                allowEvent["process_id"] = message.request.ProcessId;
+                allowEvent["create_time"] = message.request.CreateTime;
+                allowEvent["rule_id"] = WStringToUtf8(matchedAllowRule.id);
+                allowEvent["severity"] = matchedAllowRule.severity;
+                allowEvent["parent_name"] = WStringToUtf8(parentName);
+                allowEvent["child_name"] = WStringToUtf8(childName);
+                allowEvent["command_line"] = WStringToUtf8(cmdLine);
+                if (!parentImagePath.empty()) {
+                    allowEvent["parent_image_path"] = WStringToUtf8(parentImagePath);
+                }
+                if (!childImagePath.empty()) {
+                    allowEvent["child_image_path"] = WStringToUtf8(childImagePath);
+                }
+                allowEvent["file_open_name_available"] =
+                    (message.request.Flags & PROCESS_PORT_REQUEST_FLAG_FILE_OPEN_NAME_AVAILABLE) != 0;
+                if (!parentCmdLine.empty()) {
+                    allowEvent["parent_command_line"] = WStringToUtf8(parentCmdLine);
+                }
+                EmitJsonEvent(allowEvent);
+            }
+            else if (blockMatched) {
+                LogMessage(L"[!] ==================================================");
+                LogMessage(L"[!] 触发规则 ID: " + matchedRule.id);
+                LogMessage(L"[!] EventId: " + std::to_wstring(message.request.EventId));
+                LogMessage(L"[!] 威胁描述: " + matchedRule.threatDesc);
+                LogMessage(L"[!] 父进程名: " + parentName);
+                LogMessage(L"[!] 子进程名: " + childName);
+                if (!parentImagePath.empty()) {
+                    LogMessage(L"[!] 父进程路径: " + parentImagePath);
+                }
+                if (!childImagePath.empty()) {
+                    LogMessage(L"[!] 子进程路径: " + childImagePath);
+                }
+                if (!parentCmdLine.empty()) {
+                    LogMessage(L"[!] 父进程命令行: " + parentCmdLine);
+                }
+                LogMessage(L"[!] 命中的命令行: " + cmdLine);
+                LogMessage(L"[!] 执行动作: 拦截 (Severity: " + std::to_wstring(matchedRule.severity) + L")");
+                LogMessage(L"[!] ==================================================");
+
+                json blockEvent = BuildBaseJsonEvent("process_block", "warn");
+                blockEvent["event_id"] = message.request.EventId;
+                blockEvent["process_id"] = message.request.ProcessId;
+                blockEvent["create_time"] = message.request.CreateTime;
+                blockEvent["rule_id"] = WStringToUtf8(matchedRule.id);
+                blockEvent["threat_desc"] = WStringToUtf8(matchedRule.threatDesc);
+                blockEvent["severity"] = matchedRule.severity;
+                blockEvent["parent_name"] = WStringToUtf8(parentName);
+                blockEvent["child_name"] = WStringToUtf8(childName);
+                blockEvent["command_line"] = WStringToUtf8(cmdLine);
+                if (!parentImagePath.empty()) {
+                    blockEvent["parent_image_path"] = WStringToUtf8(parentImagePath);
+                }
+                if (!childImagePath.empty()) {
+                    blockEvent["child_image_path"] = WStringToUtf8(childImagePath);
+                }
+                blockEvent["file_open_name_available"] =
+                    (message.request.Flags & PROCESS_PORT_REQUEST_FLAG_FILE_OPEN_NAME_AVAILABLE) != 0;
+                if (!parentCmdLine.empty()) {
+                    blockEvent["parent_command_line"] = WStringToUtf8(parentCmdLine);
+                }
+                EmitJsonEvent(blockEvent);
+            }
+        }
+
+        CloseTrackedHandle(hProcessPort, g_ProcessPortHandle);
     }
 }
 
@@ -1070,11 +1397,10 @@ static int RunProtectionEngine(bool serviceMode) {
     }
 
     HANDLE hDevice = INVALID_HANDLE_VALUE;
+    std::thread processThread;
     std::thread driverThread;
     std::thread ruleReloadThread;
     int exitCode = 0;
-    PROCESS_EVENT eventBuffer = { 0 };
-    DWORD bytesReturned = 0;
     std::wstring rulesPath = ResolveRulesFilePath();
 
     LogMessage(serviceMode ? L"[*] HostGuard 服务模式启动中..." : L"[*] 正在初始化 HostGuard 终端防御系统...");
@@ -1113,118 +1439,22 @@ static int RunProtectionEngine(bool serviceMode) {
         LogMessage(L"[!] 警告：初始内核规则同步未完全成功，程序将继续运行并在后续重连时重试。");
     }
 
+    processThread = std::thread(ProcessVerdictMonitorThread);
     driverThread = std::thread(DriverEventMonitorThread);
     ruleReloadThread = std::thread(RulesHotReloadThread, rulesPath);
 
     LogMessage(L"[+] HostGuard 主引擎启动完毕，开始实时进程研判...");
 
-    while (!IsShutdownRequested()) {
-        BOOL success = DeviceIoControl(hDevice, IOCTL_GET_PROCESS_EVENT,
-            NULL, 0, &eventBuffer, sizeof(PROCESS_EVENT), &bytesReturned, NULL);
-
-        if (success && bytesReturned == sizeof(PROCESS_EVENT)) {
-            std::wstring parentName = GetProcessNameByPid(eventBuffer.ParentProcessId);
-            std::wstring childName = GetProcessNameByPid(eventBuffer.ProcessId);
-            std::wstring cmdLine(eventBuffer.CommandLine);
-            if (childName == L"<unknown>") {
-                childName = GetCachedProcessName(eventBuffer.ProcessId);
-            }
-            if (parentName == L"<unknown>") {
-                parentName = GetCachedProcessName(eventBuffer.ParentProcessId);
-            }
-
-            CacheProcessContext(eventBuffer.ProcessId, childName, cmdLine);
-
-            std::wstring parentCmdLine = GetCachedProcessCommandLine(eventBuffer.ParentProcessId);
-
-            PROCESS_VERDICT verdict = { 0 };
-            verdict.ProcessId = eventBuffer.ProcessId;
-            verdict.BlockProcess = FALSE;
-
-            DetectionRule matchedAllowRule;
-            if (g_RuleManager.TryMatchProcessAllowRule(parentName, childName, cmdLine, parentCmdLine, matchedAllowRule)) {
-                LogMessage(L"[+] 命中进程白名单，跳过拦截。");
-                LogMessage(L"    └─ 白名单 ID: " + matchedAllowRule.id);
-                LogMessage(L"    └─ 父进程名: " + parentName);
-                LogMessage(L"    └─ 子进程名: " + childName);
-                if (!parentCmdLine.empty()) {
-                    LogMessage(L"    └─ 父进程命令行: " + parentCmdLine);
-                }
-                LogMessage(L"    └─ 命令行: " + cmdLine);
-
-                json allowEvent = BuildBaseJsonEvent("process_allow", "info");
-                allowEvent["rule_id"] = WStringToUtf8(matchedAllowRule.id);
-                allowEvent["severity"] = matchedAllowRule.severity;
-                allowEvent["parent_name"] = WStringToUtf8(parentName);
-                allowEvent["child_name"] = WStringToUtf8(childName);
-                allowEvent["command_line"] = WStringToUtf8(cmdLine);
-                if (!parentCmdLine.empty()) {
-                    allowEvent["parent_command_line"] = WStringToUtf8(parentCmdLine);
-                }
-                EmitJsonEvent(allowEvent);
-            }
-            else {
-                DetectionRule matchedRule;
-                if (g_RuleManager.EvaluateProcessAgainstRules(parentName, childName, cmdLine, parentCmdLine, matchedRule)) {
-                    LogMessage(L"[!] ==================================================");
-                    LogMessage(L"[!] 触发规则 ID: " + matchedRule.id);
-                    LogMessage(L"[!] 威胁描述: " + matchedRule.threatDesc);
-                    LogMessage(L"[!] 父进程名: " + parentName);
-                    LogMessage(L"[!] 子进程名: " + childName);
-                    if (!parentCmdLine.empty()) {
-                        LogMessage(L"[!] 父进程命令行: " + parentCmdLine);
-                    }
-                    LogMessage(L"[!] 命中的命令行: " + cmdLine);
-                    LogMessage(L"[!] 执行动作: 拦截 (Severity: " + std::to_wstring(matchedRule.severity) + L")");
-                    LogMessage(L"[!] ==================================================");
-
-                    json blockEvent = BuildBaseJsonEvent("process_block", "warn");
-                    blockEvent["rule_id"] = WStringToUtf8(matchedRule.id);
-                    blockEvent["threat_desc"] = WStringToUtf8(matchedRule.threatDesc);
-                    blockEvent["severity"] = matchedRule.severity;
-                    blockEvent["parent_name"] = WStringToUtf8(parentName);
-                    blockEvent["child_name"] = WStringToUtf8(childName);
-                    blockEvent["command_line"] = WStringToUtf8(cmdLine);
-                    if (!parentCmdLine.empty()) {
-                        blockEvent["parent_command_line"] = WStringToUtf8(parentCmdLine);
-                    }
-                    EmitJsonEvent(blockEvent);
-
-                    verdict.BlockProcess = TRUE;
-                }
-            }
-
-            if (!DeviceIoControl(hDevice, IOCTL_SEND_VERDICT,
-                &verdict, sizeof(PROCESS_VERDICT),
-                NULL, 0, &bytesReturned, NULL)) {
-                DWORD err = GetLastError();
-                if (IsShutdownRequested() && (err == ERROR_OPERATION_ABORTED || err == ERROR_INVALID_HANDLE)) {
-                    break;
-                }
-                LogMessage(L"[!] 向驱动发送判决失败，错误码: " + std::to_wstring(err));
-                if (!ReconnectMainDevice(hDevice)) {
-                    exitCode = IsShutdownRequested() ? 0 : 1;
-                    break;
-                }
-            }
-        }
-        else {
-            DWORD err = GetLastError();
-            if (IsShutdownRequested() && (err == ERROR_OPERATION_ABORTED || err == ERROR_INVALID_HANDLE)) {
-                break;
-            }
-            LogMessage(L"[!] 获取进程事件失败，错误码: " + std::to_wstring(err));
-            if (!ReconnectMainDevice(hDevice)) {
-                exitCode = IsShutdownRequested() ? 0 : 1;
-                break;
-            }
-        }
+    while (!WaitForShutdown(1000)) {
     }
 
 Cleanup:
     RequestShutdown();
     CloseTrackedHandle(hDevice, g_MainDeviceHandle);
 
+    if (processThread.joinable()) {
+        processThread.join();
+    }
     if (ruleReloadThread.joinable()) {
         ruleReloadThread.join();
     }

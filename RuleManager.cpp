@@ -56,6 +56,109 @@ namespace {
         return lowered;
     }
 
+    bool TryMapProcessVerdictFailModeString(
+        const std::string& value,
+        ULONG& outMode) {
+        const std::string lowered = ToLowerAscii(value);
+        if (lowered == "fail_open" || lowered == "open" || lowered == "allow") {
+            outMode = PROCESS_VERDICT_FAIL_OPEN;
+            return true;
+        }
+
+        if (lowered == "fail_close" || lowered == "close" || lowered == "block") {
+            outMode = PROCESS_VERDICT_FAIL_CLOSE;
+            return true;
+        }
+
+        return false;
+    }
+
+    bool ParseProcessVerdictConfig(
+        const json& root,
+        RuleConfiguration& outConfig,
+        std::wstring* outError) {
+        const json* verdictNode = nullptr;
+        if (root.contains("process_verdict")) {
+            if (!root["process_verdict"].is_object()) {
+                if (outError != nullptr) {
+                    *outError = L"process_verdict must be an object";
+                }
+                return false;
+            }
+            verdictNode = &root["process_verdict"];
+        }
+
+        const json* timeoutNode = nullptr;
+        if (verdictNode != nullptr && verdictNode->contains("timeout_ms")) {
+            timeoutNode = &(*verdictNode)["timeout_ms"];
+        }
+        else if (root.contains("process_verdict_timeout_ms")) {
+            timeoutNode = &root["process_verdict_timeout_ms"];
+        }
+
+        if (timeoutNode != nullptr) {
+            if (!timeoutNode->is_number_unsigned() && !timeoutNode->is_number_integer()) {
+                if (outError != nullptr) {
+                    *outError = L"process verdict timeout_ms must be an integer";
+                }
+                return false;
+            }
+
+            long long timeoutValue = timeoutNode->get<long long>();
+            if (timeoutValue < static_cast<long long>(PROCESS_VERDICT_TIMEOUT_MS_MIN) ||
+                timeoutValue > static_cast<long long>(PROCESS_VERDICT_TIMEOUT_MS_MAX)) {
+                if (outError != nullptr) {
+                    *outError =
+                        L"process verdict timeout_ms out of range (" +
+                        std::to_wstring(PROCESS_VERDICT_TIMEOUT_MS_MIN) +
+                        L"-" +
+                        std::to_wstring(PROCESS_VERDICT_TIMEOUT_MS_MAX) +
+                        L")";
+                }
+                return false;
+            }
+
+            outConfig.processVerdictTimeoutMs = static_cast<ULONG>(timeoutValue);
+        }
+
+        const json* failModeNode = nullptr;
+        if (verdictNode != nullptr && verdictNode->contains("fail_mode")) {
+            failModeNode = &(*verdictNode)["fail_mode"];
+        }
+        else if (root.contains("process_verdict_fail_mode")) {
+            failModeNode = &root["process_verdict_fail_mode"];
+        }
+
+        if (failModeNode != nullptr) {
+            ULONG failMode = PROCESS_VERDICT_FAIL_OPEN;
+            bool parsed = false;
+
+            if (failModeNode->is_string()) {
+                parsed = TryMapProcessVerdictFailModeString(
+                    failModeNode->get<std::string>(),
+                    failMode);
+            }
+            else if (failModeNode->is_number_unsigned() || failModeNode->is_number_integer()) {
+                long long modeValue = failModeNode->get<long long>();
+                if (modeValue == PROCESS_VERDICT_FAIL_OPEN || modeValue == PROCESS_VERDICT_FAIL_CLOSE) {
+                    failMode = static_cast<ULONG>(modeValue);
+                    parsed = true;
+                }
+            }
+
+            if (!parsed) {
+                if (outError != nullptr) {
+                    *outError = L"process verdict fail_mode must be fail_open or fail_close";
+                }
+                return false;
+            }
+
+            outConfig.processVerdictFailMode = failMode;
+        }
+
+        return true;
+    }
+
     RuleRegexGroup* GetRuleGroupByPosition(DetectionRule& rule, int position) {
         switch (position) {
         case 1:
@@ -972,6 +1075,10 @@ bool RuleManager::TryLoadRulesFromJson(
                     return false;
                 }
                 loadedConfig.generatedAt = Utf8ToWStringLocal(root["generated_at"].get<std::string>());
+            }
+
+            if (!ParseProcessVerdictConfig(root, loadedConfig, outError)) {
+                return false;
             }
 
             if (root.contains("process_rules")) {

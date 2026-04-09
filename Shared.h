@@ -1,2 +1,2 @@
 ﻿#pragma once
-#include "Common\PebMonitorShared.h"
+#include "..\Common\PebMonitorShared.h"
