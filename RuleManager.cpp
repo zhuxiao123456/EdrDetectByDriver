@@ -156,6 +156,36 @@ namespace {
             outConfig.processVerdictFailMode = failMode;
         }
 
+        const json* captureParentNode = nullptr;
+        if (verdictNode != nullptr && verdictNode->contains("capture_parent_cmdline")) {
+            captureParentNode = &(*verdictNode)["capture_parent_cmdline"];
+        }
+        else if (root.contains("capture_parent_cmdline")) {
+            captureParentNode = &root["capture_parent_cmdline"];
+        }
+
+        if (captureParentNode != nullptr) {
+            if (captureParentNode->is_boolean()) {
+                outConfig.captureParentCommandLine =
+                    captureParentNode->get<bool>()
+                    ? PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED
+                    : PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
+            }
+            else if (captureParentNode->is_number_unsigned() || captureParentNode->is_number_integer()) {
+                long long raw = captureParentNode->get<long long>();
+                outConfig.captureParentCommandLine =
+                    (raw == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED)
+                    ? PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED
+                    : PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
+            }
+            else {
+                if (outError != nullptr) {
+                    *outError = L"capture_parent_cmdline must be boolean or 0/1";
+                }
+                return false;
+            }
+        }
+
         return true;
     }
 

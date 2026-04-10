@@ -1,25 +1,48 @@
-#pragma once
+ï»¿#pragma once
 #include <windows.h>
 #include <string>
+#include <nlohmann/json.hpp>
 
-// ÉùÃ÷È«¾Ö±äÁ¿£¨ÔÚ cpp ÖĞ¶¨Òå£©
+// å£°æ˜å…¨å±€å˜é‡ï¼ˆåœ¨ cpp ä¸­å®šä¹‰ï¼‰
 extern std::wstring g_ExeDirectory;
 
 // ===========================================================================
-// »ù´¡¸¨Öúº¯Êı
+// åŸºç¡€è¾…åŠ©å‡½æ•°
 // ===========================================================================
 std::wstring Utf8ToWString(const std::string& utf8Str);
+std::string WStringToUtf8(const std::wstring& wideStr);
 std::wstring GetExeDirectory();
+std::wstring GetProgramDataDirectory();
+std::wstring GetHostGuardDataDirectory();
+std::wstring ResolveRulesFilePath();
+std::wstring GetHostGuardLogFilePath();
+std::wstring GetHostGuardJsonLogFilePath();
+std::wstring GetCurrentTimestampForJson();
+bool EnsureDirectoryExists(const std::wstring& directoryPath);
 bool Is64BitOS();
 
 // ===========================================================================
-// ÈÕÖ¾Óë½ø³Ì¸¨Öúº¯Êı
+// æ—¥å¿—ä¸è¿›ç¨‹è¾…åŠ©å‡½æ•°
 // ===========================================================================
 void LogMessage(const std::wstring& message);
+void SetLogRuleContext(
+    const std::wstring& profileName,
+    const std::wstring& configVersion,
+    const std::wstring& generatedAt);
+void PopulateCommonJsonEventFields(
+    nlohmann::json& event,
+    const char* eventType,
+    const char* level);
+void PopulateRuleContextJsonFields(
+    nlohmann::json& event,
+    const std::wstring& profileName,
+    const std::wstring& configVersion,
+    const std::wstring& generatedAt);
+void AppendJsonLogLine(const std::string& utf8JsonLine);
 std::wstring GetProcessNameByPid(DWORD pid);
 
 // ===========================================================================
-// ¶ñÒâÌØÕ÷¼ì²â¸¨Öúº¯Êı (ÒÅÁô»ò¼òµ¥¼ì²â)
+// æ¶æ„ç‰¹å¾æ£€æµ‹è¾…åŠ©å‡½æ•° (é—ç•™æˆ–ç®€å•æ£€æµ‹)
 // ===========================================================================
 bool IsSensitiveParent(const std::wstring& parentName);
 bool IsMaliciousCommand(const std::wstring& cmdLine);

@@ -49,4 +49,5 @@ bool SetActiveDriverConfigInfo(
     const std::wstring& profileName,
     const std::wstring& generatedAt,
     ULONG processVerdictTimeoutMs,
-    ULONG processVerdictFailMode);
+    ULONG processVerdictFailMode,
+    ULONG captureParentCommandLine);

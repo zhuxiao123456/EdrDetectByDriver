@@ -759,7 +759,8 @@ bool SetActiveDriverConfigInfo(
     const std::wstring& profileName,
     const std::wstring& generatedAt,
     ULONG processVerdictTimeoutMs,
-    ULONG processVerdictFailMode) {
+    ULONG processVerdictFailMode,
+    ULONG captureParentCommandLine) {
     if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
         std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
         return false;
@@ -778,6 +779,7 @@ bool SetActiveDriverConfigInfo(
     wcscpy_s(configInfo.GeneratedAt, MAX_RULE_LENGTH, generatedAt.c_str());
     configInfo.ProcessVerdictTimeoutMs = processVerdictTimeoutMs;
     configInfo.ProcessVerdictFailMode = processVerdictFailMode;
+    configInfo.CaptureParentCommandLine = captureParentCommandLine;
 
     DWORD bytesReturned = 0;
     BOOL result = DeviceIoControl(
