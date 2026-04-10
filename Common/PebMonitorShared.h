@@ -32,6 +32,8 @@
 #define PROCESS_VERDICT_TIMEOUT_MS_MAX 10000UL
 #define PROCESS_VERDICT_FAIL_OPEN 1UL
 #define PROCESS_VERDICT_FAIL_CLOSE 2UL
+#define PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED 0UL
+#define PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED 1UL
 
 #define DRIVER_STATUS_FLAG_DEVICE_READY 0x0001UL
 #define DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED 0x0002UL
@@ -144,6 +146,7 @@ typedef struct _DRIVER_CONFIG_INFO {
     WCHAR GeneratedAt[MAX_RULE_LENGTH];
     ULONG ProcessVerdictTimeoutMs;
     ULONG ProcessVerdictFailMode;
+    ULONG CaptureParentCommandLine;
 } DRIVER_CONFIG_INFO, *PDRIVER_CONFIG_INFO;
 
 typedef struct _DRIVER_RUNTIME_STATUS {
@@ -162,6 +165,7 @@ typedef struct _DRIVER_RUNTIME_STATUS {
     ULONGLONG LastProcessVerdictTimeoutTime;
     ULONG ProcessVerdictTimeoutMs;
     ULONG ProcessVerdictFailMode;
+    ULONG CaptureParentCommandLine;
     WCHAR ConfigVersion[MAX_RULE_LENGTH];
     WCHAR ProfileName[MAX_RULE_LENGTH];
     WCHAR GeneratedAt[MAX_RULE_LENGTH];

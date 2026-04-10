@@ -17,6 +17,7 @@ typedef struct _PEB_LITE {
 } PEB_LITE, *PPEB_LITE;
 
 EXTERN_C PVOID PsGetProcessPeb(_In_ PEPROCESS Process);
+EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 static VOID CopyUnicodeStringToFixedBuffer(
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -330,6 +331,13 @@ static BOOLEAN TryParseUnsignedInteger(_In_opt_z_ PCWSTR text, _Out_ ULONGLONG* 
             return FALSE;
         }
 
+        const ULONGLONG maxUlonglong = ~((ULONGLONG)0);
+        ULONGLONG maxBeforeMulAdd =
+            (maxUlonglong - (ULONGLONG)digit) / (ULONGLONG)base;
+        if (result > maxBeforeMulAdd) {
+            return FALSE;
+        }
+
         result = (result * base) + digit;
     }
 
@@ -412,6 +420,46 @@ static VOID GetCurrentProcessName(
 
     buffer[i] = L'\0';
     ExFreePool(imagePath);
+}
+
+static BOOLEAN GetCurrentProcessNameFast(
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength) {
+    if (buffer == NULL || bufferLength == 0) {
+        return FALSE;
+    }
+
+    buffer[0] = L'\0';
+
+    PCHAR ansiName = PsGetProcessImageFileName(PsGetCurrentProcess());
+    if (ansiName == NULL) {
+        return FALSE;
+    }
+
+    SIZE_T copied = 0;
+    while (copied + 1 < bufferLength && copied < 15) {
+        CHAR ch = ansiName[copied];
+        if (ch == '\0') {
+            break;
+        }
+
+        if (ch >= 'A' && ch <= 'Z') {
+            ch = (CHAR)(ch - 'A' + 'a');
+        }
+        buffer[copied] = (WCHAR)(UCHAR)ch;
+        copied++;
+    }
+
+    // PsGetProcessImageFileName only exposes a 15-byte ANSI name slot.
+    // When we hit this boundary, treat it as potentially truncated and
+    // force the caller to fall back to full path-based name capture.
+    if (copied >= 15) {
+        buffer[0] = L'\0';
+        return FALSE;
+    }
+
+    buffer[copied] = L'\0';
+    return copied > 0;
 }
 
 static VOID CaptureProcessImagePath(
@@ -906,6 +954,36 @@ static BOOLEAN MatchFileRule(
     return TRUE;
 }
 
+static BOOLEAN MatchFileRuleWithoutProcess(
+    _In_ const FILE_RULE* rule,
+    _In_ ULONG actualOperation,
+    _In_opt_z_ PCWSTR targetPath,
+    _In_opt_z_ PCWSTR extension) {
+    if (rule == NULL) {
+        return FALSE;
+    }
+
+    if (rule->Operation == FILE_OPERATION_CREATE && actualOperation != FILE_OPERATION_CREATE) {
+        return FALSE;
+    }
+
+    if (rule->Operation == FILE_OPERATION_WRITE && actualOperation != FILE_OPERATION_WRITE) {
+        return FALSE;
+    }
+
+    if ((rule->MatchFlags & FILE_MATCH_FLAG_TARGET_PATH) &&
+        !MatchRegistryField(rule->TargetPathMatchType, rule->TargetPath, targetPath)) {
+        return FALSE;
+    }
+
+    if ((rule->MatchFlags & FILE_MATCH_FLAG_EXTENSION) &&
+        !MatchRegistryField(rule->ExtensionMatchType, rule->Extension, extension)) {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static ULONG DetermineFileOperationFromCreate(_In_ PFLT_CALLBACK_DATA Data) {
     if (Data == NULL || Data->Iopb == NULL) {
         return 0;
@@ -991,17 +1069,30 @@ FLT_PREOP_CALLBACK_STATUS FilePreCreateOperation(
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
     }
 
+    {
+        BOOLEAN hasRules = FALSE;
+        AcquireSharedPushLock(&g_FileRuleLock);
+        hasRules = (g_FileRuleCount != 0);
+        ReleaseSharedPushLock(&g_FileRuleLock);
+        if (!hasRules) {
+            ExReleaseRundownProtection(&g_RundownRef);
+            return FLT_PREOP_SUCCESS_NO_CALLBACK;
+        }
+    }
+
     WCHAR processName[MAX_RULE_LENGTH];
     WCHAR targetPathBuffer[MAX_REG_PATH_LENGTH];
     WCHAR extensionBuffer[MAX_RULE_LENGTH];
-    FILE_RULE matchedRule = {};
+    WCHAR matchedRuleId[MAX_RULE_ID_LENGTH];
+    ULONG matchedRuleSeverity = 0;
     BOOLEAN ruleMatched = FALSE;
+    BOOLEAN needProcessCheck = FALSE;
+    BOOLEAN processNameResolved = FALSE;
 
     processName[0] = L'\0';
     targetPathBuffer[0] = L'\0';
     extensionBuffer[0] = L'\0';
-
-    GetCurrentProcessName(processName, RTL_NUMBER_OF(processName));
+    matchedRuleId[0] = L'\0';
 
     PFLT_FILE_NAME_INFORMATION fileNameInfo = NULL;
     if (NT_SUCCESS(FltGetFileNameInformation(
@@ -1030,13 +1121,57 @@ FLT_PREOP_CALLBACK_STATUS FilePreCreateOperation(
 
     AcquireSharedPushLock(&g_FileRuleLock);
     for (ULONG i = 0; i < g_FileRuleCount; ++i) {
-        if (MatchFileRule(&g_FileRules[i], fileOperation, processName, targetPathBuffer, extensionBuffer)) {
-            matchedRule = g_FileRules[i];
-            ruleMatched = TRUE;
-            break;
+        if (MatchFileRuleWithoutProcess(&g_FileRules[i], fileOperation, targetPathBuffer, extensionBuffer)) {
+            if ((g_FileRules[i].MatchFlags & FILE_MATCH_FLAG_PROCESS_NAME) == 0) {
+                CopyWideStringToFixedBuffer(
+                    matchedRuleId,
+                    RTL_NUMBER_OF(matchedRuleId),
+                    g_FileRules[i].RuleId);
+                matchedRuleSeverity = g_FileRules[i].Severity;
+                ruleMatched = TRUE;
+                break;
+            }
+
+            needProcessCheck = TRUE;
         }
     }
     ReleaseSharedPushLock(&g_FileRuleLock);
+
+    if (!ruleMatched && !needProcessCheck) {
+        ExReleaseRundownProtection(&g_RundownRef);
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    if (!ruleMatched && needProcessCheck) {
+        if (!processNameResolved) {
+            if (!GetCurrentProcessNameFast(processName, RTL_NUMBER_OF(processName))) {
+                GetCurrentProcessName(processName, RTL_NUMBER_OF(processName));
+            }
+            processNameResolved = TRUE;
+        }
+
+        AcquireSharedPushLock(&g_FileRuleLock);
+        for (ULONG i = 0; i < g_FileRuleCount; ++i) {
+            if ((g_FileRules[i].MatchFlags & FILE_MATCH_FLAG_PROCESS_NAME) == 0) {
+                continue;
+            }
+
+            if (!MatchFileRuleWithoutProcess(&g_FileRules[i], fileOperation, targetPathBuffer, extensionBuffer)) {
+                continue;
+            }
+
+            if (MatchFileRule(&g_FileRules[i], fileOperation, processName, targetPathBuffer, extensionBuffer)) {
+                CopyWideStringToFixedBuffer(
+                    matchedRuleId,
+                    RTL_NUMBER_OF(matchedRuleId),
+                    g_FileRules[i].RuleId);
+                matchedRuleSeverity = g_FileRules[i].Severity;
+                ruleMatched = TRUE;
+                break;
+            }
+        }
+        ReleaseSharedPushLock(&g_FileRuleLock);
+    }
 
     if (!ruleMatched) {
         ExReleaseRundownProtection(&g_RundownRef);
@@ -1048,7 +1183,7 @@ FLT_PREOP_CALLBACK_STATUS FilePreCreateOperation(
 
     KdPrint(("[EDR] Blocked file operation. Operation=%lu RuleId=%ws Process=%ws Path=%ws\n",
         fileOperation,
-        matchedRule.RuleId,
+        matchedRuleId,
         processName,
         targetPathBuffer));
 
@@ -1058,8 +1193,8 @@ FLT_PREOP_CALLBACK_STATUS FilePreCreateOperation(
         fileOperation,
         HandleToULong(PsGetCurrentProcessId()),
         processName,
-        matchedRule.RuleId,
-        matchedRule.Severity,
+        matchedRuleId,
+        matchedRuleSeverity,
         &targetPath,
         NULL,
         NULL,
@@ -1087,8 +1222,9 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
     WCHAR infoClassBuffer[MAX_RULE_LENGTH];
     WCHAR valueNameBuffer[MAX_RULE_LENGTH];
     WCHAR valueDataBuffer[MAX_RULE_LENGTH];
-    REGISTRY_RULE matchedRule = {};
-    REGISTRY_RULE matchedAllowRule = {};
+    WCHAR matchedRuleId[MAX_RULE_ID_LENGTH];
+    WCHAR matchedAllowRuleId[MAX_RULE_ID_LENGTH];
+    ULONG matchedRuleSeverity = 0;
     BOOLEAN registryAllowMatched = FALSE;
     BOOLEAN registryRuleMatched = FALSE;
 
@@ -1102,6 +1238,8 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
     infoClassBuffer[0] = L'\0';
     valueNameBuffer[0] = L'\0';
     valueDataBuffer[0] = L'\0';
+    matchedRuleId[0] = L'\0';
+    matchedAllowRuleId[0] = L'\0';
 
     switch (notifyClass) {
     case RegNtPreSetValueKey: {
@@ -1271,7 +1409,10 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
                 infoClassBuffer,
                 valueNameBuffer,
                 valueDataBuffer)) {
-                matchedAllowRule = g_RegistryAllowRules[i];
+                CopyWideStringToFixedBuffer(
+                    matchedAllowRuleId,
+                    RTL_NUMBER_OF(matchedAllowRuleId),
+                    g_RegistryAllowRules[i].RuleId);
                 registryAllowMatched = TRUE;
                 break;
             }
@@ -1292,7 +1433,11 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
                 infoClassBuffer,
                 valueNameBuffer,
                 valueDataBuffer)) {
-                matchedRule = g_RegistryRules[i];
+                CopyWideStringToFixedBuffer(
+                    matchedRuleId,
+                    RTL_NUMBER_OF(matchedRuleId),
+                    g_RegistryRules[i].RuleId);
+                matchedRuleSeverity = g_RegistryRules[i].Severity;
                 registryRuleMatched = TRUE;
                 break;
             }
@@ -1303,7 +1448,7 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
     else {
         KdPrint(("[EDR] Allowed registry operation by allow rule. Operation=%lu RuleId=%ws Key=%ws Value=%ws Data=%ws\n",
             registryOperation,
-            matchedAllowRule.RuleId,
+            matchedAllowRuleId,
             keyPathBuffer,
             valueNameBuffer,
             valueDataBuffer));
@@ -1318,7 +1463,7 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
 
         KdPrint(("[EDR] Blocked registry operation. Operation=%lu RuleId=%ws Key=%ws InfoClass=%ws Value=%ws Data=%ws\n",
             registryOperation,
-            matchedRule.RuleId,
+            matchedRuleId,
             keyPathBuffer,
             infoClassBuffer,
             valueNameBuffer,
@@ -1330,8 +1475,8 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
             0,
             HandleToULong(PsGetCurrentProcessId()),
             processName,
-            matchedRule.RuleId,
-            matchedRule.Severity,
+            matchedRuleId,
+            matchedRuleSeverity,
             &keyPathString,
             infoClassBuffer,
             &valueNameString,
@@ -1421,10 +1566,22 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         request.CommandLine[0] = L'\0';
     }
 
-    CaptureProcessCommandLineByProcessId(
-        CreateInfo->ParentProcessId,
-        request.ParentCommandLine,
-        RTL_NUMBER_OF(request.ParentCommandLine));
+    BOOLEAN captureParentCmdline = FALSE;
+    AcquireSharedPushLock(&g_RuntimeStatusLock);
+    if (g_CaptureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED) {
+        captureParentCmdline = TRUE;
+    }
+    ReleaseSharedPushLock(&g_RuntimeStatusLock);
+
+    if (captureParentCmdline) {
+        CaptureProcessCommandLineByProcessId(
+            CreateInfo->ParentProcessId,
+            request.ParentCommandLine,
+            RTL_NUMBER_OF(request.ParentCommandLine));
+    }
+    else {
+        request.ParentCommandLine[0] = L'\0';
+    }
 
     RecordProcessVerdictRequestEvent();
 
@@ -1441,18 +1598,24 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     }
     ReleaseSharedPushLock(&g_RuntimeStatusLock);
 
+    PFLT_FILTER filterHandle = NULL;
+    PFLT_PORT clientPort = NULL;
+
     AcquireSharedPushLock(&g_ProcessPortLock);
-    if (g_FilterHandle != NULL && g_ProcessClientPort != NULL) {
+    filterHandle = g_FilterHandle;
+    clientPort = g_ProcessClientPort;
+    ReleaseSharedPushLock(&g_ProcessPortLock);
+
+    if (filterHandle != NULL && clientPort != NULL) {
         sendStatus = FltSendMessage(
-            g_FilterHandle,
-            &g_ProcessClientPort,
+            filterHandle,
+            &clientPort,
             &request,
             sizeof(request),
             &reply,
             &replyLength,
             &timeout);
     }
-    ReleaseSharedPushLock(&g_ProcessPortLock);
 
     if (NT_SUCCESS(sendStatus) &&
         replyLength >= sizeof(PROCESS_PORT_REPLY) &&

@@ -77,6 +77,7 @@ extern ULONGLONG g_LastProcessPortDisconnectTime;
 extern ULONGLONG g_LastProcessVerdictTimeoutTime;
 extern ULONG g_ProcessVerdictTimeoutMs;
 extern ULONG g_ProcessVerdictFailMode;
+extern ULONG g_CaptureParentCommandLine;
 extern WCHAR g_ActiveConfigVersion[MAX_RULE_LENGTH];
 extern WCHAR g_ActiveProfileName[MAX_RULE_LENGTH];
 extern WCHAR g_ActiveGeneratedAt[MAX_RULE_LENGTH];

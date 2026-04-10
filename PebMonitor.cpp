@@ -46,6 +46,7 @@ ULONGLONG g_LastProcessPortDisconnectTime = 0;
 ULONGLONG g_LastProcessVerdictTimeoutTime = 0;
 ULONG g_ProcessVerdictTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
 ULONG g_ProcessVerdictFailMode = PROCESS_VERDICT_FAIL_OPEN;
+ULONG g_CaptureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
 WCHAR g_ActiveConfigVersion[MAX_RULE_LENGTH];
 WCHAR g_ActiveProfileName[MAX_RULE_LENGTH];
 WCHAR g_ActiveGeneratedAt[MAX_RULE_LENGTH];
@@ -91,6 +92,10 @@ static PDRIVER_BLACKLIST_TRIE_NODE FindDriverBlacklistChild(
     return NULL;
 }
 
+static BOOLEAN IsPathSeparatorCharacter(_In_ WCHAR character) {
+    return character == L'\\' || character == L'/';
+}
+
 static VOID DetachDriverBlacklistChild(
     _Inout_ PDRIVER_BLACKLIST_TRIE_NODE parent,
     _In_ PDRIVER_BLACKLIST_TRIE_NODE target) {
@@ -133,7 +138,15 @@ BOOLEAN MatchDriverBlacklistRuleLocked(_In_ PCUNICODE_STRING FullImageName) {
         }
 
         if (current->IsTerminal) {
-            return TRUE;
+            USHORT matchedStartIndex = (USHORT)(index - 1);
+            if (matchedStartIndex == 0) {
+                return TRUE;
+            }
+
+            if (IsPathSeparatorCharacter(FullImageName->Buffer[matchedStartIndex]) ||
+                IsPathSeparatorCharacter(FullImageName->Buffer[matchedStartIndex - 1])) {
+                return TRUE;
+            }
         }
     }
 
@@ -393,6 +406,19 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath) {
     UNREFERENCED_PARAMETER(RegistryPath);
     DriverObject->DriverUnload = UnloadDriver;
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOLEAN lookasideInitialized = FALSE;
+    BOOLEAN deviceCreated = FALSE;
+    BOOLEAN symbolicLinkCreated = FALSE;
+    BOOLEAN filterRegistered = FALSE;
+    BOOLEAN processPortCreated = FALSE;
+    BOOLEAN registryCallbackRegistered = FALSE;
+    BOOLEAN processCallbackRegistered = FALSE;
+    BOOLEAN imageCallbackRegistered = FALSE;
+    PSECURITY_DESCRIPTOR securityDescriptor = NULL;
+    UNICODE_STRING processPortName = { 0 };
+    OBJECT_ATTRIBUTES processPortAttributes = { 0 };
+    UNICODE_STRING altitude = { 0 };
 
     ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
 
@@ -407,6 +433,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
         sizeof(DRIVER_EVENT_NODE),
         'drPM',
         0);
+    lookasideInitialized = TRUE;
 
     ExInitializePushLock(&g_BlacklistLock);
     g_BlacklistCount = 0;
@@ -439,6 +466,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     g_LastProcessVerdictTimeoutTime = 0;
     g_ProcessVerdictTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
     g_ProcessVerdictFailMode = PROCESS_VERDICT_FAIL_OPEN;
+    g_CaptureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
     g_NextProcessEventId = 0;
     RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
     RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
@@ -450,7 +478,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\DosDevices\\PebMonitor");
     UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
 
-    NTSTATUS status = IoCreateDeviceSecure(
+    status = IoCreateDeviceSecure(
         DriverObject,
         0,
         &devName,
@@ -462,14 +490,15 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
         &g_DeviceObject
     );
     if (!NT_SUCCESS(status)) {
-        return status;
+        goto Cleanup;
     }
+    deviceCreated = TRUE;
 
     status = IoCreateSymbolicLink(&symLink, &devName);
     if (!NT_SUCCESS(status)) {
-        IoDeleteDevice(g_DeviceObject);
-        return status;
+        goto Cleanup;
     }
+    symbolicLinkCreated = TRUE;
 
     DriverObject->MajorFunction[IRP_MJ_CREATE] = DispatchCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = DispatchCreateClose;
@@ -477,25 +506,16 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
 
     status = FltRegisterFilter(DriverObject, &g_FilterRegistration, &g_FilterHandle);
     if (!NT_SUCCESS(status)) {
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
+    filterRegistered = TRUE;
 
-    PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     status = FltBuildDefaultSecurityDescriptor(&securityDescriptor, FLT_PORT_ALL_ACCESS);
     if (!NT_SUCCESS(status)) {
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
 
-    UNICODE_STRING processPortName = RTL_CONSTANT_STRING(PEBMONITOR_PROCESS_PORT_NAME);
-    OBJECT_ATTRIBUTES processPortAttributes;
+    RtlInitUnicodeString(&processPortName, PEBMONITOR_PROCESS_PORT_NAME);
     InitializeObjectAttributes(
         &processPortAttributes,
         &processPortName,
@@ -513,82 +533,91 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
         ProcessPortMessageNotify,
         1);
     FltFreeSecurityDescriptor(securityDescriptor);
+    securityDescriptor = NULL;
 
     if (!NT_SUCCESS(status)) {
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
+    processPortCreated = TRUE;
 
-    UNICODE_STRING altitude;
     RtlInitUnicodeString(&altitude, L"320000");
     status = CmRegisterCallbackEx(RegistryCallback, &altitude, DriverObject, NULL, &g_RegCookie, NULL);
     if (!NT_SUCCESS(status)) {
-        CloseProcessCommunicationPorts();
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
+    registryCallbackRegistered = TRUE;
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED, TRUE);
 
     status = PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallbackEx, FALSE);
     if (!NT_SUCCESS(status)) {
-        CmUnRegisterCallback(g_RegCookie);
-        g_RegCookie.QuadPart = 0;
-        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED, FALSE);
-        CloseProcessCommunicationPorts();
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
+    processCallbackRegistered = TRUE;
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED, TRUE);
 
     status = PsSetLoadImageNotifyRoutine(ImageNotifyCallback);
     if (!NT_SUCCESS(status)) {
-        CmUnRegisterCallback(g_RegCookie);
-        g_RegCookie.QuadPart = 0;
-        PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallbackEx, TRUE);
-        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED, FALSE);
-        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED, FALSE);
-        CloseProcessCommunicationPorts();
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
+    imageCallbackRegistered = TRUE;
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_IMAGE_CALLBACK_REGISTERED, TRUE);
 
     status = FltStartFiltering(g_FilterHandle);
     if (!NT_SUCCESS(status)) {
-        PsRemoveLoadImageNotifyRoutine(ImageNotifyCallback);
-        CmUnRegisterCallback(g_RegCookie);
-        g_RegCookie.QuadPart = 0;
-        PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallbackEx, TRUE);
-        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED, FALSE);
-        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED, FALSE);
-        CloseProcessCommunicationPorts();
-        FltUnregisterFilter(g_FilterHandle);
-        g_FilterHandle = NULL;
-        IoDeleteSymbolicLink(&symLink);
-        IoDeleteDevice(g_DeviceObject);
-        g_DeviceObject = NULL;
-        return status;
+        goto Cleanup;
     }
 
-    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_IMAGE_CALLBACK_REGISTERED, TRUE);
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_FILE_FILTER_READY, TRUE);
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_DEVICE_READY, TRUE);
 
     KdPrint(("[PebMonitor] INFO: Driver Loaded Successfully with Registry + File Protection.\n"));
     return STATUS_SUCCESS;
+
+Cleanup:
+    if (securityDescriptor != NULL) {
+        FltFreeSecurityDescriptor(securityDescriptor);
+        securityDescriptor = NULL;
+    }
+
+    if (imageCallbackRegistered) {
+        PsRemoveLoadImageNotifyRoutine(ImageNotifyCallback);
+        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_IMAGE_CALLBACK_REGISTERED, FALSE);
+    }
+
+    if (processCallbackRegistered) {
+        PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallbackEx, TRUE);
+        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED, FALSE);
+    }
+
+    if (registryCallbackRegistered) {
+        CmUnRegisterCallback(g_RegCookie);
+        g_RegCookie.QuadPart = 0;
+        SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED, FALSE);
+    }
+
+    if (processPortCreated) {
+        CloseProcessCommunicationPorts();
+    }
+
+    if (filterRegistered) {
+        FltUnregisterFilter(g_FilterHandle);
+        g_FilterHandle = NULL;
+    }
+
+    if (symbolicLinkCreated) {
+        IoDeleteSymbolicLink(&symLink);
+    }
+
+    if (deviceCreated) {
+        IoDeleteDevice(g_DeviceObject);
+        g_DeviceObject = NULL;
+    }
+
+    if (lookasideInitialized) {
+        ExDeleteNPagedLookasideList(&g_DriverEventLookaside);
+    }
+
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_FILE_FILTER_READY, FALSE);
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_DEVICE_READY, FALSE);
+    return status;
 }

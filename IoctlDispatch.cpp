@@ -14,6 +14,7 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
     runtimeStatus->LastProcessVerdictTimeoutTime = g_LastProcessVerdictTimeoutTime;
     runtimeStatus->ProcessVerdictTimeoutMs = g_ProcessVerdictTimeoutMs;
     runtimeStatus->ProcessVerdictFailMode = g_ProcessVerdictFailMode;
+    runtimeStatus->CaptureParentCommandLine = g_CaptureParentCommandLine;
     RtlStringCchCopyW(runtimeStatus->ConfigVersion, RTL_NUMBER_OF(runtimeStatus->ConfigVersion), g_ActiveConfigVersion);
     RtlStringCchCopyW(runtimeStatus->ProfileName, RTL_NUMBER_OF(runtimeStatus->ProfileName), g_ActiveProfileName);
     RtlStringCchCopyW(runtimeStatus->GeneratedAt, RTL_NUMBER_OF(runtimeStatus->GeneratedAt), g_ActiveGeneratedAt);
@@ -108,12 +109,18 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             failMode = PROCESS_VERDICT_FAIL_OPEN;
         }
 
+        ULONG captureParentCmdline = configInfo->CaptureParentCommandLine;
+        if (captureParentCmdline != PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED) {
+            captureParentCmdline = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
+        }
+
         AcquireExclusivePushLock(&g_RuntimeStatusLock);
         RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
         RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
         RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
         g_ProcessVerdictTimeoutMs = timeoutMs;
         g_ProcessVerdictFailMode = failMode;
+        g_CaptureParentCommandLine = captureParentCmdline;
         RtlStringCchCopyW(g_ActiveConfigVersion, RTL_NUMBER_OF(g_ActiveConfigVersion), configInfo->ConfigVersion);
         RtlStringCchCopyW(g_ActiveProfileName, RTL_NUMBER_OF(g_ActiveProfileName), configInfo->ProfileName);
         RtlStringCchCopyW(g_ActiveGeneratedAt, RTL_NUMBER_OF(g_ActiveGeneratedAt), configInfo->GeneratedAt);
