@@ -1,4 +1,4 @@
-#include "RuleManager.h"
+﻿#include "RuleManager.h"
 
 #include <windows.h>
 
@@ -8,6 +8,7 @@
 #include <cwctype>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <utility>
 
@@ -72,6 +73,31 @@ namespace {
 
         return false;
     }
+
+    std::wstring TrimRuleText(const std::wstring& value) {
+        size_t begin = 0;
+        while (begin < value.size() && iswspace(value[begin])) {
+            ++begin;
+        }
+
+        size_t end = value.size();
+        while (end > begin && iswspace(value[end - 1])) {
+            --end;
+        }
+
+        return value.substr(begin, end - begin);
+    }
+
+    std::wstring ToLowerWide(const std::wstring& value) {
+        std::wstring lowered = value;
+        std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+            [](wchar_t ch) {
+                return static_cast<wchar_t>(towlower(ch));
+            });
+        return lowered;
+    }
+
+            bool TryParseFlexibleBoolean(const json& node, bool& outValue);
 
     bool ParseProcessVerdictConfig(
         const json& root,
@@ -184,6 +210,106 @@ namespace {
                 }
                 return false;
             }
+        }
+
+        return true;
+    }
+
+        bool TryParseFlexibleBoolean(const json& node, bool& outValue) {
+        if (node.is_boolean()) {
+            outValue = node.get<bool>();
+            return true;
+        }
+
+        if (node.is_number_unsigned() || node.is_number_integer()) {
+            const long long rawValue = node.get<long long>();
+            if (rawValue == 0 || rawValue == 1) {
+                outValue = (rawValue == 1);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    bool ParseAutoResponseConfig(
+        const json& root,
+        RuleConfiguration& outConfig,
+        std::wstring* outError) {
+        const json* responseNode = nullptr;
+        if (root.contains("response")) {
+            if (!root["response"].is_object()) {
+                if (outError != nullptr) {
+                    *outError = L"response must be an object";
+                }
+                return false;
+            }
+
+            responseNode = &root["response"];
+        }
+
+        const auto findNode = [&](const char* nestedName, const char* flatName) -> const json* {
+            if (responseNode != nullptr && responseNode->contains(nestedName)) {
+                return &(*responseNode)[nestedName];
+            }
+            if (flatName != nullptr && root.contains(flatName)) {
+                return &root[flatName];
+            }
+            return nullptr;
+        };
+
+        const json* terminateOnRegistryNode =
+            findNode("auto_terminate_on_registry_block", "auto_terminate_on_registry_block");
+        if (terminateOnRegistryNode != nullptr &&
+            !TryParseFlexibleBoolean(*terminateOnRegistryNode, outConfig.autoResponse.terminateOnRegistryBlock)) {
+            if (outError != nullptr) {
+                *outError = L"auto_terminate_on_registry_block must be boolean or 0/1";
+            }
+            return false;
+        }
+
+        const json* minSeverityNode =
+            findNode("auto_terminate_min_severity", "auto_terminate_min_severity");
+        if (minSeverityNode != nullptr) {
+            if (!minSeverityNode->is_number_unsigned() && !minSeverityNode->is_number_integer()) {
+                if (outError != nullptr) {
+                    *outError = L"auto_terminate_min_severity must be an integer";
+                }
+                return false;
+            }
+
+            const long long rawSeverity = minSeverityNode->get<long long>();
+            if (rawSeverity < 0 ||
+                rawSeverity > static_cast<long long>((std::numeric_limits<int>::max)())) {
+                if (outError != nullptr) {
+                    *outError = L"auto_terminate_min_severity out of range";
+                }
+                return false;
+            }
+
+            outConfig.autoResponse.minSeverity = static_cast<int>(rawSeverity);
+        }
+
+        const json* cooldownNode =
+            findNode("auto_terminate_cooldown_ms", "auto_terminate_cooldown_ms");
+        if (cooldownNode != nullptr) {
+            if (!cooldownNode->is_number_unsigned() && !cooldownNode->is_number_integer()) {
+                if (outError != nullptr) {
+                    *outError = L"auto_terminate_cooldown_ms must be an integer";
+                }
+                return false;
+            }
+
+            const long long rawCooldown = cooldownNode->get<long long>();
+            if (rawCooldown < 0 ||
+                rawCooldown > static_cast<long long>((std::numeric_limits<unsigned long>::max)())) {
+                if (outError != nullptr) {
+                    *outError = L"auto_terminate_cooldown_ms out of range";
+                }
+                return false;
+            }
+
+            outConfig.autoResponse.cooldownMs = static_cast<ULONG>(rawCooldown);
         }
 
         return true;
@@ -370,37 +496,7 @@ namespace {
         return true;
     }
 
-    bool ParseDriverBlacklist(
-        const json& driverArray,
-        std::vector<std::wstring>& outDriverBlacklist) {
-        if (!driverArray.is_array()) {
-            return false;
-        }
-
-        for (json::const_iterator item = driverArray.begin(); item != driverArray.end(); ++item) {
-            std::wstring driverName;
-
-            if (item->is_string()) {
-                driverName = Utf8ToWStringLocal(item->get<std::string>());
-            }
-            else if (item->is_object() && item->contains("name") && (*item)["name"].is_string()) {
-                driverName = Utf8ToWStringLocal((*item)["name"].get<std::string>());
-            }
-
-            driverName = TrimWhitespace(driverName);
-            if (driverName.empty()) {
-                continue;
-            }
-
-            if (std::find(outDriverBlacklist.begin(), outDriverBlacklist.end(), driverName) == outDriverBlacklist.end()) {
-                outDriverBlacklist.push_back(driverName);
-            }
-        }
-
-        return true;
-    }
-
-    bool HasAnyEnabledRegistryField(const RegistryRuleDefinition& rule) {
+        bool HasAnyEnabledRegistryField(const RegistryRuleDefinition& rule) {
         return rule.processNameRule.enabled ||
             rule.keyPathRule.enabled ||
             rule.infoClassRule.enabled ||
@@ -550,40 +646,7 @@ namespace {
         return false;
     }
 
-    bool HasAnyEnabledFileField(const FileRuleDefinition& rule) {
-        return rule.processNameRule.enabled ||
-            rule.targetPathRule.enabled ||
-            rule.extensionRule.enabled;
-    }
-
-    bool ParseFileOperation(const json& root, ULONG& outOperation) {
-        outOperation = FILE_OPERATION_CREATE_OR_WRITE;
-        if (!root.contains("operation")) {
-            return true;
-        }
-
-        if (!root["operation"].is_string()) {
-            return false;
-        }
-
-        const std::string lowered = ToLowerAscii(root["operation"].get<std::string>());
-        if (lowered == "create") {
-            outOperation = FILE_OPERATION_CREATE;
-            return true;
-        }
-        if (lowered == "write") {
-            outOperation = FILE_OPERATION_WRITE;
-            return true;
-        }
-        if (lowered == "create_or_write") {
-            outOperation = FILE_OPERATION_CREATE_OR_WRITE;
-            return true;
-        }
-
-        return false;
-    }
-
-    bool CopyToFixedBuffer(
+            bool CopyToFixedBuffer(
         const std::wstring& value,
         WCHAR* buffer,
         size_t bufferLength,
@@ -686,66 +749,7 @@ namespace {
         return !outRules.empty();
     }
 
-    bool ExpandSingleFileRule(
-        const FileRuleDefinition& definition,
-        std::vector<FILE_RULE>& outRules) {
-        const std::vector<std::wstring> processValues = definition.processNameRule.enabled ?
-            definition.processNameRule.values : std::vector<std::wstring>(1, L"");
-        const std::vector<std::wstring> targetPathValues = definition.targetPathRule.enabled ?
-            definition.targetPathRule.values : std::vector<std::wstring>(1, L"");
-        const std::vector<std::wstring> extensionValues = definition.extensionRule.enabled ?
-            definition.extensionRule.values : std::vector<std::wstring>(1, L"");
-
-        for (std::vector<std::wstring>::const_iterator processIt = processValues.begin();
-            processIt != processValues.end();
-            ++processIt) {
-            for (std::vector<std::wstring>::const_iterator pathIt = targetPathValues.begin();
-                pathIt != targetPathValues.end();
-                ++pathIt) {
-                for (std::vector<std::wstring>::const_iterator extensionIt = extensionValues.begin();
-                    extensionIt != extensionValues.end();
-                    ++extensionIt) {
-                    FILE_RULE compiledRule = {};
-                    compiledRule.Operation = definition.operation;
-                    compiledRule.Severity = static_cast<ULONG>(definition.severity);
-
-                    if (!CopyToFixedBuffer(definition.id, compiledRule.RuleId, MAX_RULE_ID_LENGTH, L"rule_id", definition.id)) {
-                        return false;
-                    }
-
-                    if (definition.processNameRule.enabled) {
-                        compiledRule.MatchFlags |= FILE_MATCH_FLAG_PROCESS_NAME;
-                        compiledRule.ProcessNameMatchType = definition.processNameRule.matchType;
-                        if (!CopyToFixedBuffer(*processIt, compiledRule.ProcessName, MAX_RULE_LENGTH, L"process_name", definition.id)) {
-                            return false;
-                        }
-                    }
-
-                    if (definition.targetPathRule.enabled) {
-                        compiledRule.MatchFlags |= FILE_MATCH_FLAG_TARGET_PATH;
-                        compiledRule.TargetPathMatchType = definition.targetPathRule.matchType;
-                        if (!CopyToFixedBuffer(*pathIt, compiledRule.TargetPath, MAX_REG_PATH_LENGTH, L"target_path", definition.id)) {
-                            return false;
-                        }
-                    }
-
-                    if (definition.extensionRule.enabled) {
-                        compiledRule.MatchFlags |= FILE_MATCH_FLAG_EXTENSION;
-                        compiledRule.ExtensionMatchType = definition.extensionRule.matchType;
-                        if (!CopyToFixedBuffer(*extensionIt, compiledRule.Extension, MAX_RULE_LENGTH, L"file_extension", definition.id)) {
-                            return false;
-                        }
-                    }
-
-                    outRules.push_back(compiledRule);
-                }
-            }
-        }
-
-        return !outRules.empty();
-    }
-
-    bool ParseSingleRegistryRule(
+        bool ParseSingleRegistryRule(
         const json& item,
         RegistryRuleDefinition& outDefinition,
         std::vector<REGISTRY_RULE>& outCompiledRules) {
@@ -806,79 +810,7 @@ namespace {
         return ExpandSingleRegistryRule(outDefinition, outCompiledRules);
     }
 
-    bool ParseSingleFileRule(
-        const json& item,
-        FileRuleDefinition& outDefinition,
-        std::vector<FILE_RULE>& outCompiledRules) {
-        outDefinition.id = Utf8ToWStringLocal(item.value("id", ""));
-        outDefinition.threatDesc = Utf8ToWStringLocal(item.value("threat_desc", ""));
-        outDefinition.severity = item.value("severity", 0);
-
-        if (outDefinition.id.empty()) {
-            return false;
-        }
-
-        json body = item;
-        if (item.contains("match") && item["match"].is_object()) {
-            body = item["match"];
-        }
-        else if (item.contains("rule")) {
-            if (item["rule"].is_object()) {
-                body = item["rule"];
-            }
-            else if (item["rule"].is_string()) {
-                body = json::parse(item["rule"].get<std::string>());
-            }
-        }
-
-        if (!ParseFileOperation(item, outDefinition.operation) ||
-            !ParseFileOperation(body, outDefinition.operation) ||
-            !ParseRegistryField(body, "process_name", REGISTRY_MATCH_TYPE_EXACT, outDefinition.processNameRule)) {
-            std::wcerr << L"[RuleManager] Skip file rule " << outDefinition.id
-                << L": invalid process_name or operation schema." << std::endl;
-            return false;
-        }
-
-        if (body.contains("target_path")) {
-            if (!ParseRegistryField(body, "target_path", REGISTRY_MATCH_TYPE_CONTAINS, outDefinition.targetPathRule)) {
-                std::wcerr << L"[RuleManager] Skip file rule " << outDefinition.id
-                    << L": invalid target_path schema." << std::endl;
-                return false;
-            }
-        }
-        else if (body.contains("path")) {
-            if (!ParseRegistryField(body, "path", REGISTRY_MATCH_TYPE_CONTAINS, outDefinition.targetPathRule)) {
-                std::wcerr << L"[RuleManager] Skip file rule " << outDefinition.id
-                    << L": invalid path schema." << std::endl;
-                return false;
-            }
-        }
-
-        if (body.contains("file_extension")) {
-            if (!ParseRegistryField(body, "file_extension", REGISTRY_MATCH_TYPE_SUFFIX, outDefinition.extensionRule)) {
-                std::wcerr << L"[RuleManager] Skip file rule " << outDefinition.id
-                    << L": invalid file_extension schema." << std::endl;
-                return false;
-            }
-        }
-        else if (body.contains("extension")) {
-            if (!ParseRegistryField(body, "extension", REGISTRY_MATCH_TYPE_SUFFIX, outDefinition.extensionRule)) {
-                std::wcerr << L"[RuleManager] Skip file rule " << outDefinition.id
-                    << L": invalid extension schema." << std::endl;
-                return false;
-            }
-        }
-
-        if (!HasAnyEnabledFileField(outDefinition)) {
-            std::wcerr << L"[RuleManager] Skip file rule " << outDefinition.id
-                << L": no file match fields were configured." << std::endl;
-            return false;
-        }
-
-        return ExpandSingleFileRule(outDefinition, outCompiledRules);
-    }
-
-    bool ParseRegistryRuleArray(
+        bool ParseRegistryRuleArray(
         const json& ruleArray,
         std::vector<RegistryRuleDefinition>& outDefinitions,
         std::vector<REGISTRY_RULE>& outCompiledRules) {
@@ -906,35 +838,8 @@ namespace {
         return true;
     }
 
-    bool ParseFileRuleArray(
-        const json& ruleArray,
-        std::vector<FileRuleDefinition>& outDefinitions,
-        std::vector<FILE_RULE>& outCompiledRules) {
-        if (!ruleArray.is_array()) {
-            return false;
-        }
 
-        for (json::const_iterator item = ruleArray.begin(); item != ruleArray.end(); ++item) {
-            FileRuleDefinition definition;
-            std::vector<FILE_RULE> compiledRules;
-            if (!ParseSingleFileRule(*item, definition, compiledRules)) {
-                continue;
-            }
-
-            if (outCompiledRules.size() + compiledRules.size() > MAX_FILE_RULE_COUNT) {
-                std::wcerr << L"[RuleManager] file_rules exceed kernel capacity ("
-                    << MAX_FILE_RULE_COUNT << L")." << std::endl;
-                return false;
-            }
-
-            outDefinitions.push_back(definition);
-            outCompiledRules.insert(outCompiledRules.end(), compiledRules.begin(), compiledRules.end());
-        }
-
-        return true;
-    }
 }
-
 RuleManager::RuleManager() {}
 RuleManager::~RuleManager() {}
 
@@ -956,26 +861,6 @@ size_t RuleManager::GetRegistryRuleCount() const {
 size_t RuleManager::GetRegistryAllowRuleCount() const {
     std::lock_guard<std::mutex> lock(m_Lock);
     return m_ActiveConfig.registryAllowRuleDefinitions.size();
-}
-
-size_t RuleManager::GetDriverBlacklistCount() const {
-    std::lock_guard<std::mutex> lock(m_Lock);
-    return m_ActiveConfig.driverBlacklist.size();
-}
-
-size_t RuleManager::GetFileRuleCount() const {
-    std::lock_guard<std::mutex> lock(m_Lock);
-    return m_ActiveConfig.fileRuleDefinitions.size();
-}
-
-std::vector<std::wstring> RuleManager::GetDriverBlacklist() const {
-    std::lock_guard<std::mutex> lock(m_Lock);
-    return m_ActiveConfig.driverBlacklist;
-}
-
-std::vector<FILE_RULE> RuleManager::GetFileRules() const {
-    std::lock_guard<std::mutex> lock(m_Lock);
-    return m_ActiveConfig.fileRules;
 }
 
 std::vector<REGISTRY_RULE> RuleManager::GetRegistryRules() const {
@@ -1003,24 +888,6 @@ RuleConfiguration RuleManager::GetRuleConfigurationSnapshot() const {
     return m_ActiveConfig;
 }
 
-bool RuleManager::TryGetFileRuleMetadata(
-    const std::wstring& ruleId,
-    std::wstring& outThreatDesc,
-    int& outSeverity) const {
-    std::lock_guard<std::mutex> lock(m_Lock);
-    for (std::vector<FileRuleDefinition>::const_iterator it = m_ActiveConfig.fileRuleDefinitions.begin();
-        it != m_ActiveConfig.fileRuleDefinitions.end();
-        ++it) {
-        if (it->id == ruleId) {
-            outThreatDesc = it->threatDesc;
-            outSeverity = it->severity;
-            return true;
-        }
-    }
-
-    return false;
-}
-
 bool RuleManager::TryGetRegistryRuleMetadata(
     const std::wstring& ruleId,
     std::wstring& outThreatDesc,
@@ -1039,9 +906,6 @@ bool RuleManager::TryGetRegistryRuleMetadata(
     return false;
 }
 
-std::wstring RuleManager::Utf8ToWString(const std::string& utf8Str) {
-    return Utf8ToWStringLocal(utf8Str);
-}
 
 bool RuleManager::TryLoadRulesFromJson(
     const std::wstring& jsonFilePath,
@@ -1111,6 +975,10 @@ bool RuleManager::TryLoadRulesFromJson(
                 return false;
             }
 
+            if (!ParseAutoResponseConfig(root, loadedConfig, outError)) {
+                return false;
+            }
+
             if (root.contains("process_rules")) {
                 if (!ParseDetectionRuleArray(root["process_rules"], loadedConfig.processRules)) {
                     if (outError != nullptr) {
@@ -1124,27 +992,6 @@ bool RuleManager::TryLoadRulesFromJson(
                 if (!ParseDetectionRuleArray(root["process_allow_rules"], loadedConfig.processAllowRules)) {
                     if (outError != nullptr) {
                         *outError = L"invalid process_allow_rules";
-                    }
-                    return false;
-                }
-            }
-
-            if (root.contains("driver_blacklist")) {
-                if (!ParseDriverBlacklist(root["driver_blacklist"], loadedConfig.driverBlacklist)) {
-                    if (outError != nullptr) {
-                        *outError = L"invalid driver_blacklist";
-                    }
-                    return false;
-                }
-            }
-
-            if (root.contains("file_rules")) {
-                if (!ParseFileRuleArray(
-                    root["file_rules"],
-                    loadedConfig.fileRuleDefinitions,
-                    loadedConfig.fileRules)) {
-                    if (outError != nullptr) {
-                        *outError = L"invalid file_rules";
                     }
                     return false;
                 }
@@ -1187,6 +1034,19 @@ bool RuleManager::TryLoadRulesFromJson(
         if (loadedConfig.profileName.empty()) {
             loadedConfig.profileName = L"default";
         }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
         outConfig = std::move(loadedConfig);
         return true;
@@ -1257,3 +1117,4 @@ bool RuleManager::TryMatchProcessAllowRule(
         parentCmdLine,
         outMatchedRule);
 }
+

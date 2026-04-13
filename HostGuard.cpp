@@ -1,5 +1,6 @@
 ﻿#include <windows.h>
 #include <fltuser.h>
+#include <algorithm>
 #include <iostream>
 #include <atomic>
 #include <mutex>
@@ -44,6 +45,10 @@ namespace {
         PROCESS_PORT_REPLY reply;
     };
 
+    ;
+
+    ;
+
     struct ProcessCacheEntry {
         std::wstring processName;
         std::wstring commandLine;
@@ -61,6 +66,11 @@ namespace {
     std::unordered_map<DWORD, ProcessCacheEntry> g_ProcessCache;
     const size_t kMaxProcessCacheEntries = 4096;
     const ULONGLONG kProcessCacheTtlMs = 10ULL * 60ULL * 1000ULL;
+    std::mutex g_AutoResponseLock;
+    std::unordered_map<DWORD, ULONGLONG> g_AutoTerminateHistory;
+    const size_t kMaxAutoTerminateHistoryEntries = 2048;
+    const ULONGLONG kAutoTerminateHistoryRetentionMs = 10ULL * 60ULL * 1000ULL;
+    const LONG kDefaultTerminateExitStatus = static_cast<LONG>(0xC0000022L);
 
     bool IsTrackedHandleValid(HANDLE handle) {
         return handle != NULL && handle != INVALID_HANDLE_VALUE;
@@ -119,6 +129,7 @@ namespace {
             processPortHandle != driverEventHandle) {
             CancelIoEx(processPortHandle, NULL);
         }
+
     }
 
     bool EnsureRuntimeEvents() {
@@ -246,20 +257,7 @@ namespace {
         }
     }
 
-    std::wstring FileOperationToString(ULONG operation) {
-        switch (operation) {
-        case FILE_OPERATION_CREATE:
-            return L"create";
-        case FILE_OPERATION_WRITE:
-            return L"write";
-        case FILE_OPERATION_CREATE_OR_WRITE:
-            return L"create_or_write";
-        default:
-            return L"unknown";
-        }
-    }
-
-    std::wstring DescribeConfigIdentity(const RuleConfiguration& config) {
+        std::wstring DescribeConfigIdentity(const RuleConfiguration& config) {
         std::wstring description =
             L"Profile=" + (config.profileName.empty() ? L"default" : config.profileName) +
             L", Version=" + (config.configVersion.empty() ? L"unversioned" : config.configVersion);
@@ -277,6 +275,31 @@ namespace {
         return (failMode == PROCESS_VERDICT_FAIL_CLOSE) ? L"fail_close" : L"fail_open";
     }
 
+    std::wstring ResponseActionToString(ULONG responseAction) {
+        switch (responseAction) {
+        case RESPONSE_ACTION_TERMINATE_PROCESS:
+            return L"terminate_process";
+        default:
+            return L"unknown_response_action";
+        }
+    }
+
+        std::wstring DriverEventTypeToString(ULONG eventType) {
+        switch (eventType) {
+        case DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION:
+            return L"blocked_registry_operation";
+        case DRIVER_EVENT_TYPE_RESPONSE_ACTION:
+            return L"response_action";
+        default:
+            return L"unknown_driver_event";
+        }
+    }
+    std::wstring FormatNtStatusHex(LONG status) {
+        wchar_t buffer[32] = {};
+        swprintf_s(buffer, RTL_NUMBER_OF(buffer), L"0x%08X", static_cast<unsigned int>(status));
+        return std::wstring(buffer);
+    }
+
     bool HasConfigIdentityChanged(const RuleConfiguration& previousConfig, const RuleConfiguration& newConfig) {
         return previousConfig.profileName != newConfig.profileName ||
             previousConfig.configVersion != newConfig.configVersion ||
@@ -284,7 +307,7 @@ namespace {
             previousConfig.sourcePath != newConfig.sourcePath;
     }
 
-    void AppendPrefixedConfigFields(
+        void AppendPrefixedConfigFields(
         json& event,
         const RuleConfiguration& config,
         const char* prefix) {
@@ -307,9 +330,14 @@ namespace {
             WStringToUtf8(ProcessVerdictFailModeToString(config.processVerdictFailMode));
         event[keyPrefix + "capture_parent_cmdline"] =
             (config.captureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED);
+        event[keyPrefix + "auto_terminate_on_registry_block"] =
+            config.autoResponse.terminateOnRegistryBlock;
+        event[keyPrefix + "auto_terminate_min_severity"] =
+            config.autoResponse.minSeverity;
+        event[keyPrefix + "auto_terminate_cooldown_ms"] =
+            config.autoResponse.cooldownMs;
     }
-
-    void LogConfigSummary(const RuleConfiguration& config) {
+        void LogConfigSummary(const RuleConfiguration& config) {
         std::wstring prefix = L"[+] 当前配置已生效";
         if (!config.profileName.empty() || !config.configVersion.empty()) {
             prefix += L" (Profile=" +
@@ -326,17 +354,18 @@ namespace {
             prefix +
             L": 进程规则 " + std::to_wstring(config.processRules.size()) +
             L" 条, 进程白名单 " + std::to_wstring(config.processAllowRules.size()) +
-            L" 条, 文件规则 " + std::to_wstring(config.fileRuleDefinitions.size()) +
             L" 条, 注册表规则 " + std::to_wstring(config.registryRuleDefinitions.size()) +
             L" 条, 注册表白名单 " + std::to_wstring(config.registryAllowRuleDefinitions.size()) +
-            L" 条, 驱动黑名单 " + std::to_wstring(config.driverBlacklist.size()) +
             L" 条, 进程裁决超时 " + std::to_wstring(config.processVerdictTimeoutMs) +
             L"ms, 超时策略 " + ProcessVerdictFailModeToString(config.processVerdictFailMode) +
             L", 父命令行捕获 " +
             std::wstring((config.captureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED) ? L"enabled" : L"disabled") +
-            L"。");
+            L", 自动终止[registry=" +
+            std::wstring(config.autoResponse.terminateOnRegistryBlock ? L"on" : L"off") +
+            L", min_severity=" + std::to_wstring(config.autoResponse.minSeverity) +
+            L", cooldown=" + std::to_wstring(config.autoResponse.cooldownMs) + L"ms]。"
+        );
     }
-
     std::wstring FormatDriverSystemTimeValue(ULONGLONG rawTime) {
         if (rawTime == 0) {
             return L"<never>";
@@ -370,7 +399,7 @@ namespace {
         return std::wstring(buffer);
     }
 
-    void LogDriverStatusSnapshot(const DRIVER_RUNTIME_STATUS& status) {
+        void LogDriverStatusSnapshot(const DRIVER_RUNTIME_STATUS& status) {
         std::wstring flagsText;
         if (status.StatusFlags & DRIVER_STATUS_FLAG_DEVICE_READY) {
             flagsText += L"device ";
@@ -378,14 +407,8 @@ namespace {
         if (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED) {
             flagsText += L"process_cb ";
         }
-        if (status.StatusFlags & DRIVER_STATUS_FLAG_IMAGE_CALLBACK_REGISTERED) {
-            flagsText += L"image_cb ";
-        }
         if (status.StatusFlags & DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED) {
             flagsText += L"registry_cb ";
-        }
-        if (status.StatusFlags & DRIVER_STATUS_FLAG_FILE_FILTER_READY) {
-            flagsText += L"file_filter ";
         }
         if (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) {
             flagsText += L"process_port ";
@@ -396,11 +419,11 @@ namespace {
 
         LogMessage(
             L"[+] 驱动状态: Flags=" + flagsText +
-            L", 驱动黑名单=" + std::to_wstring(status.DriverBlacklistCount) +
-            L", 文件规则=" + std::to_wstring(status.FileRuleCount) +
             L", 注册表拦截规则=" + std::to_wstring(status.RegistryRuleCount) +
             L", 注册表白名单规则=" + std::to_wstring(status.RegistryAllowRuleCount) +
-            L", 驱动事件队列=" + std::to_wstring(status.DriverEventQueueCount));
+            L", 驱动事件队列=" + std::to_wstring(status.DriverEventQueueCount) +
+            L", 事件丢弃=" + std::to_wstring(status.DriverEventDropCount) +
+            L", 分配失败=" + std::to_wstring(status.DriverEventAllocFailCount));
 
         LogMessage(
             L"[+] 进程裁决链路: connected=" +
@@ -428,7 +451,6 @@ namespace {
                 (status.GeneratedAt[0] != L'\0' ? (L", GeneratedAt=" + std::wstring(status.GeneratedAt)) : L""));
         }
     }
-
     bool QueryAndLogDriverStatus(HANDLE hDevice) {
         DRIVER_RUNTIME_STATUS status = {};
         if (!QueryDriverStatus(hDevice, status)) {
@@ -574,6 +596,180 @@ static HANDLE OpenDriverDeviceOverlapped() {
         0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
 }
 
+static std::wstring ResolveTargetProcessNameForResponse(
+    DWORD processId,
+    const std::wstring& processNameHint) {
+    if (!processNameHint.empty()) {
+        return ToLowerCopy(processNameHint);
+    }
+
+    const std::wstring cachedName = GetCachedProcessName(processId);
+    if (!cachedName.empty()) {
+        return ToLowerCopy(cachedName);
+    }
+
+    return ToLowerCopy(GetProcessNameByPid(processId));
+}
+
+static void PruneAutoTerminateHistoryLocked(ULONGLONG nowTick) {
+    for (std::unordered_map<DWORD, ULONGLONG>::iterator it = g_AutoTerminateHistory.begin();
+        it != g_AutoTerminateHistory.end();) {
+        if (nowTick - it->second > kAutoTerminateHistoryRetentionMs) {
+            it = g_AutoTerminateHistory.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+
+    while (g_AutoTerminateHistory.size() > kMaxAutoTerminateHistoryEntries) {
+        std::unordered_map<DWORD, ULONGLONG>::iterator oldestIt = g_AutoTerminateHistory.begin();
+        for (std::unordered_map<DWORD, ULONGLONG>::iterator it = g_AutoTerminateHistory.begin();
+            it != g_AutoTerminateHistory.end();
+            ++it) {
+            if (it->second < oldestIt->second) {
+                oldestIt = it;
+            }
+        }
+        g_AutoTerminateHistory.erase(oldestIt);
+    }
+}
+
+static bool ReserveAutoTerminateAttempt(DWORD processId, ULONG cooldownMs) {
+    if (processId == 0) {
+        return false;
+    }
+
+    if (cooldownMs == 0) {
+        return true;
+    }
+
+    const ULONGLONG nowTick = GetTickCount64();
+    std::lock_guard<std::mutex> lock(g_AutoResponseLock);
+    PruneAutoTerminateHistoryLocked(nowTick);
+
+    std::unordered_map<DWORD, ULONGLONG>::const_iterator it = g_AutoTerminateHistory.find(processId);
+    if (it != g_AutoTerminateHistory.end() &&
+        nowTick >= it->second &&
+        nowTick - it->second < cooldownMs) {
+        return false;
+    }
+
+    g_AutoTerminateHistory[processId] = nowTick;
+    return true;
+}
+
+static void MaybeAutoTerminateProcessForDriverEvent(
+    const DRIVER_EVENT& driverEvent,
+    const std::wstring& processName,
+    const std::wstring& ruleId,
+    const std::wstring& threatDesc,
+    int severity,
+    const std::wstring& targetPath,
+    const std::wstring& registryOperation) {
+    if (driverEvent.ProcessId == 0 ||
+        driverEvent.ProcessId == GetCurrentProcessId() ||
+        driverEvent.EventType != DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION) {
+        return;
+    }
+
+    const RuleConfiguration config = g_RuleManager.GetRuleConfigurationSnapshot();
+    if (!config.autoResponse.terminateOnRegistryBlock || severity < config.autoResponse.minSeverity) {
+        return;
+    }
+
+    if (!ReserveAutoTerminateAttempt(driverEvent.ProcessId, config.autoResponse.cooldownMs)) {
+        return;
+    }
+
+    const std::wstring resolvedProcessName =
+        ResolveTargetProcessNameForResponse(driverEvent.ProcessId, processName);
+    const std::wstring triggerEventType = DriverEventTypeToString(driverEvent.EventType);
+
+    json requestEvent = BuildBaseJsonEvent("response_auto_terminate_requested", "warn", config);
+    requestEvent["response_action"] = "terminate_process";
+    requestEvent["response_mode"] = "auto";
+    requestEvent["target_pid"] = driverEvent.ProcessId;
+    requestEvent["target_process_name"] = WStringToUtf8(resolvedProcessName);
+    requestEvent["trigger_driver_event_type"] = WStringToUtf8(triggerEventType);
+    requestEvent["trigger_severity"] = severity;
+    requestEvent["cooldown_ms"] = config.autoResponse.cooldownMs;
+    requestEvent["exit_status"] = static_cast<unsigned long>(kDefaultTerminateExitStatus);
+    requestEvent["registry_operation"] = WStringToUtf8(registryOperation);
+    if (!ruleId.empty()) {
+        requestEvent["trigger_rule_id"] = WStringToUtf8(ruleId);
+    }
+    if (!threatDesc.empty()) {
+        requestEvent["trigger_threat_desc"] = WStringToUtf8(threatDesc);
+    }
+    if (!targetPath.empty()) {
+        requestEvent["trigger_target_path"] = WStringToUtf8(targetPath);
+    }
+    EmitJsonEvent(requestEvent);
+
+    HANDLE hDevice = OpenDriverDevice();
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        const DWORD errorCode = GetLastError();
+        LogMessage(
+            L"[!] 自动终止响应失败：无法连接驱动设备，PID=" +
+            std::to_wstring(driverEvent.ProcessId) +
+            L", 错误码=" + std::to_wstring(errorCode));
+
+        json resultEvent = BuildBaseJsonEvent("response_auto_terminate_result", "warn", config);
+        resultEvent["response_action"] = "terminate_process";
+        resultEvent["response_mode"] = "auto";
+        resultEvent["target_pid"] = driverEvent.ProcessId;
+        resultEvent["target_process_name"] = WStringToUtf8(resolvedProcessName);
+        resultEvent["trigger_driver_event_type"] = WStringToUtf8(triggerEventType);
+        resultEvent["trigger_severity"] = severity;
+        resultEvent["success"] = false;
+        resultEvent["win32_error"] = errorCode;
+        resultEvent["reason"] = "open_driver_device_failed";
+        EmitJsonEvent(resultEvent);
+        return;
+    }
+
+    DWORD errorCode = ERROR_SUCCESS;
+    bool terminated = TerminateTargetProcess(
+        hDevice,
+        driverEvent.ProcessId,
+        kDefaultTerminateExitStatus,
+        &errorCode);
+    CloseHandle(hDevice);
+
+    LogMessage(
+        terminated
+        ? (L"[+] 已根据注册表阻断事件自动终止目标进程，PID=" + std::to_wstring(driverEvent.ProcessId))
+        : (L"[!] 注册表阻断触发自动终止失败，PID=" + std::to_wstring(driverEvent.ProcessId) +
+            L", 错误码=" + std::to_wstring(errorCode)));
+
+    json resultEvent = BuildBaseJsonEvent(
+        "response_auto_terminate_result",
+        terminated ? "info" : "warn",
+        config);
+    resultEvent["response_action"] = "terminate_process";
+    resultEvent["response_mode"] = "auto";
+    resultEvent["target_pid"] = driverEvent.ProcessId;
+    resultEvent["target_process_name"] = WStringToUtf8(resolvedProcessName);
+    resultEvent["trigger_driver_event_type"] = WStringToUtf8(triggerEventType);
+    resultEvent["trigger_severity"] = severity;
+    resultEvent["success"] = terminated;
+    resultEvent["exit_status"] = static_cast<unsigned long>(kDefaultTerminateExitStatus);
+    resultEvent["registry_operation"] = WStringToUtf8(registryOperation);
+    if (!ruleId.empty()) {
+        resultEvent["trigger_rule_id"] = WStringToUtf8(ruleId);
+    }
+    if (!threatDesc.empty()) {
+        resultEvent["trigger_threat_desc"] = WStringToUtf8(threatDesc);
+    }
+    if (!targetPath.empty()) {
+        resultEvent["trigger_target_path"] = WStringToUtf8(targetPath);
+    }
+    if (!terminated) {
+        resultEvent["win32_error"] = errorCode;
+    }
+    EmitJsonEvent(resultEvent);
+}
 static bool IsPortOperationCancelled(HRESULT hr) {
     return hr == HRESULT_FROM_WIN32(ERROR_OPERATION_ABORTED) ||
         hr == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
@@ -623,6 +819,22 @@ static std::wstring ServiceStateToString(DWORD state) {
     default:
         return L"state_" + std::to_wstring(state);
     }
+}
+
+static bool TryParseProcessId(const wchar_t* text, DWORD& processId) {
+    processId = 0;
+    if (text == NULL || text[0] == L'\0') {
+        return false;
+    }
+
+    wchar_t* end = NULL;
+    unsigned long parsed = wcstoul(text, &end, 10);
+    if (end == text || (end != NULL && *end != L'\0') || parsed == 0 || parsed > MAXDWORD) {
+        return false;
+    }
+
+    processId = static_cast<DWORD>(parsed);
+    return true;
 }
 
 static int RunStatusCommand(const std::wstring& rulesPath) {
@@ -740,44 +952,58 @@ static int RunUninstallServiceCommand() {
     return 0;
 }
 
-static bool ApplyDriverRules(HANDLE hDevice, const RuleConfiguration& config) {
-    if (!ClearDriverRules(hDevice)) {
-        LogMessage(L"[!] 警告：清空驱动黑名单失败，继续尝试下发配置中的规则。");
+static int RunTerminateProcessCommand(const wchar_t* pidText) {
+    DWORD processId = 0;
+    if (!TryParseProcessId(pidText, processId)) {
+        std::wcerr << L"[-] 错误：请提供有效的十进制 PID，例如：HostGuard.exe terminate 1234" << std::endl;
+        return 1;
     }
 
-    bool allSucceeded = true;
-    for (std::vector<std::wstring>::const_iterator it = config.driverBlacklist.begin();
-        it != config.driverBlacklist.end();
-        ++it) {
-        const std::wstring& driver = *it;
-        if (AddDriverRule(hDevice, driver)) {
-            LogMessage(L"[+] 成功下发驱动黑名单规则: " + driver);
-        }
-        else {
-            allSucceeded = false;
-        }
+    const std::wstring processName = GetProcessNameByPid(processId);
+
+    json requestEvent = BuildBaseJsonEvent("response_terminate_requested", "warn");
+    requestEvent["response_action"] = "terminate_process";
+    requestEvent["target_pid"] = processId;
+    requestEvent["target_process_name"] = WStringToUtf8(processName);
+    requestEvent["exit_status"] = static_cast<unsigned long>(kDefaultTerminateExitStatus);
+    EmitJsonEvent(requestEvent);
+
+    HANDLE hDevice = OpenDriverDevice();
+    if (hDevice == INVALID_HANDLE_VALUE) {
+        std::wcerr << L"[-] 错误：无法连接驱动设备 (错误码: " << GetLastError() << L")" << std::endl;
+
+        json resultEvent = BuildBaseJsonEvent("response_terminate_result", "warn");
+        resultEvent["response_action"] = "terminate_process";
+        resultEvent["target_pid"] = processId;
+        resultEvent["target_process_name"] = WStringToUtf8(processName);
+        resultEvent["success"] = false;
+        resultEvent["win32_error"] = GetLastError();
+        resultEvent["reason"] = "open_driver_device_failed";
+        EmitJsonEvent(resultEvent);
+        return 1;
     }
 
-    LogMessage(L"[+] 已同步驱动黑名单规则数量: " + std::to_wstring(config.driverBlacklist.size()));
-    return allSucceeded;
-}
+    DWORD errorCode = ERROR_SUCCESS;
+    bool terminated = TerminateTargetProcess(hDevice, processId, kDefaultTerminateExitStatus, &errorCode);
+    CloseHandle(hDevice);
 
-static bool ApplyFileRules(HANDLE hDevice, const RuleConfiguration& config) {
-    if (!ClearFileRules(hDevice)) {
-        LogMessage(L"[!] 警告：清空驱动文件规则失败，继续尝试下发配置中的规则。");
+    json resultEvent = BuildBaseJsonEvent("response_terminate_result", terminated ? "info" : "warn");
+    resultEvent["response_action"] = "terminate_process";
+    resultEvent["target_pid"] = processId;
+    resultEvent["target_process_name"] = WStringToUtf8(processName);
+    resultEvent["success"] = terminated;
+    resultEvent["exit_status"] = static_cast<unsigned long>(kDefaultTerminateExitStatus);
+    if (!terminated) {
+        resultEvent["win32_error"] = errorCode;
+    }
+    EmitJsonEvent(resultEvent);
+
+    if (!terminated) {
+        return 1;
     }
 
-    bool allSucceeded = true;
-    for (std::vector<FILE_RULE>::const_iterator it = config.fileRules.begin();
-        it != config.fileRules.end();
-        ++it) {
-        if (!AddFileRule(hDevice, *it)) {
-            allSucceeded = false;
-        }
-    }
-
-    LogMessage(L"[+] 已同步文件拦截规则数量: " + std::to_wstring(config.fileRules.size()));
-    return allSucceeded;
+    std::wcout << L"[+] 已向驱动下发终止请求，PID=" << processId << std::endl;
+    return 0;
 }
 
 static bool ApplyRegistryRules(HANDLE hDevice, const RuleConfiguration& config) {
@@ -826,20 +1052,16 @@ static bool SyncDriverConfigInfo(HANDLE hDevice, const RuleConfiguration& config
 
     return true;
 }
-
 static bool ApplyKernelRules(HANDLE hDevice, const RuleConfiguration& config) {
-    bool driverRulesOk = ApplyDriverRules(hDevice, config);
-    bool fileRulesOk = ApplyFileRules(hDevice, config);
     bool registryRulesOk = ApplyRegistryRules(hDevice, config);
     bool configInfoOk = SyncDriverConfigInfo(hDevice, config);
 
-    if (driverRulesOk && fileRulesOk && registryRulesOk && configInfoOk) {
+    if (registryRulesOk && configInfoOk) {
         QueryAndLogDriverStatus(hDevice);
     }
 
-    return driverRulesOk && fileRulesOk && registryRulesOk && configInfoOk;
+    return registryRulesOk && configInfoOk;
 }
-
 static bool ApplyKernelRules(HANDLE hDevice) {
     RuleConfiguration activeConfig = g_RuleManager.GetRuleConfigurationSnapshot();
     return ApplyKernelRules(hDevice, activeConfig);
@@ -942,10 +1164,9 @@ static bool ReloadRulesFromDisk(
     configEvent["load_mode"] = isHotReload ? "hot_reload" : "initial";
     configEvent["process_rule_count"] = activeConfig.processRules.size();
     configEvent["process_allow_rule_count"] = activeConfig.processAllowRules.size();
-    configEvent["file_rule_count"] = activeConfig.fileRules.size();
     configEvent["registry_rule_count"] = activeConfig.registryRules.size();
     configEvent["registry_allow_rule_count"] = activeConfig.registryAllowRules.size();
-    configEvent["driver_blacklist_count"] = activeConfig.driverBlacklist.size();
+    AppendPrefixedConfigFields(configEvent, activeConfig, "");
     if (isHotReload) {
         AppendPrefixedConfigFields(configEvent, previousConfig, "previous_");
     }
@@ -1009,6 +1230,8 @@ namespace {
         DRIVER_EVENT driverEvent;
         DWORD bytesReturned;
     };
+
+    ;
 }
 
 static bool IsProcessPortDisconnected(HRESULT hr) {
@@ -1476,16 +1699,11 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     std::wstring threatDesc;
     int severity = static_cast<int>(driverEvent.Severity);
     std::wstring registryOperation = RegistryOperationToString(driverEvent.RegistryOperation);
-    std::wstring fileOperation = FileOperationToString(driverEvent.FileOperation);
+    std::wstring responseAction = ResponseActionToString(driverEvent.ResponseAction);
+    std::wstring responseStatusText = FormatNtStatusHex(driverEvent.ResponseStatus);
+    bool responseSucceeded = driverEvent.ResponseStatus >= 0;
 
-    if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_FILE_OPERATION && !ruleId.empty()) {
-        int configuredSeverity = 0;
-        if (g_RuleManager.TryGetFileRuleMetadata(ruleId, threatDesc, configuredSeverity) &&
-            severity == 0) {
-            severity = configuredSeverity;
-        }
-    }
-    else if (!ruleId.empty()) {
+    if (!ruleId.empty()) {
         int configuredSeverity = 0;
         if (g_RuleManager.TryGetRegistryRuleMetadata(ruleId, threatDesc, configuredSeverity) &&
             severity == 0) {
@@ -1494,33 +1712,7 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     }
 
     LogMessage(L"#########################################################");
-    if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_SERVICE) {
-        LogMessage(L"[!] 已在驱动服务注册阶段阻止高危驱动。");
-        LogMessage(L"    └─ 目标驱动: " + targetPath);
-    }
-    else if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_FILE_OPERATION) {
-        LogMessage(L"[!] 已在文件创建/写入阶段阻止高危文件落地。");
-        LogMessage(L"    └─ 操作类型: " + fileOperation);
-        if (!ruleId.empty()) {
-            LogMessage(L"    └─ 规则 ID: " + ruleId);
-        }
-        if (!threatDesc.empty()) {
-            LogMessage(L"    └─ 威胁描述: " + threatDesc);
-        }
-        if (severity > 0) {
-            LogMessage(L"    └─ Severity: " + std::to_wstring(severity));
-        }
-        if (!processName.empty()) {
-            LogMessage(L"    └─ 发起进程: " + processName + L" (PID: " + std::to_wstring(driverEvent.ProcessId) + L")");
-        }
-        if (!targetPath.empty()) {
-            LogMessage(L"    └─ 目标文件: " + targetPath);
-        }
-        if (!valueData.empty()) {
-            LogMessage(L"    └─ 文件扩展名: " + valueData);
-        }
-    }
-    else if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION) {
+    if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION) {
         LogMessage(L"[!] 已在注册表操作阶段阻止高危修改。");
         LogMessage(L"    └─ 操作类型: " + registryOperation);
         if (!ruleId.empty()) {
@@ -1551,17 +1743,31 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
             }
         }
     }
+    else if (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION) {
+        LogMessage(responseSucceeded
+            ? L"[+] 驱动响应动作执行成功。"
+            : L"[!] 驱动响应动作执行失败。");
+        LogMessage(L"    └─ 响应动作: " + responseAction);
+        LogMessage(L"    └─ 目标 PID: " + std::to_wstring(driverEvent.ProcessId));
+        if (!processName.empty()) {
+            LogMessage(L"    └─ 目标进程: " + processName);
+        }
+        LogMessage(L"    └─ NTSTATUS: " + responseStatusText);
+    }
     else {
-        LogMessage(L"[!] 发现高危驱动加载告警（该事件不表示已阻断）。");
-        LogMessage(L"    └─ 目标驱动: " + targetPath);
+        LogMessage(L"[!] 收到未知驱动事件类型: " + std::to_wstring(driverEvent.EventType));
     }
 
-    json driverEventJson = BuildBaseJsonEvent("driver_event", "warn");
+    json driverEventJson = BuildBaseJsonEvent(
+        "driver_event",
+        (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION && responseSucceeded) ? "info" : "warn");
     driverEventJson["driver_event_type"] = driverEvent.EventType;
     driverEventJson["process_id"] = driverEvent.ProcessId;
     driverEventJson["severity"] = severity;
-    if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_FILE_OPERATION) {
-        driverEventJson["file_operation"] = WStringToUtf8(fileOperation);
+    if (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION) {
+        driverEventJson["response_action"] = WStringToUtf8(responseAction);
+        driverEventJson["response_status"] = WStringToUtf8(responseStatusText);
+        driverEventJson["response_success"] = responseSucceeded;
     }
     else {
         driverEventJson["registry_operation"] = WStringToUtf8(registryOperation);
@@ -1585,10 +1791,7 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
         driverEventJson["value_name"] = WStringToUtf8(valueName);
     }
     if (!valueData.empty()) {
-        if (driverEvent.EventType == DRIVER_EVENT_TYPE_BLOCKED_FILE_OPERATION) {
-            driverEventJson["file_extension"] = WStringToUtf8(valueData);
-        }
-        else if (driverEvent.RegistryOperation == REGISTRY_OPERATION_RENAME_KEY) {
+        if (driverEvent.RegistryOperation == REGISTRY_OPERATION_RENAME_KEY) {
             driverEventJson["new_name"] = WStringToUtf8(valueData);
         }
         else {
@@ -1597,9 +1800,15 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     }
     EmitJsonEvent(driverEventJson);
 
-    LogMessage(L"#########################################################");
+    MaybeAutoTerminateProcessForDriverEvent(
+        driverEvent,
+        processName,
+        ruleId,
+        threatDesc,
+        severity,
+        targetPath,
+        registryOperation);
 }
-
 void DriverEventMonitorThread() {
     DWORD reconnectBackoffMs = kDriverEventBackoffMinMs;
 
@@ -1787,7 +1996,7 @@ static int RunProtectionEngine(bool serviceMode) {
     driverThread = std::thread(DriverEventMonitorThread);
     ruleReloadThread = std::thread(RulesHotReloadThread, rulesPath);
 
-    LogMessage(L"[+] HostGuard 主引擎启动完毕，开始实时进程研判...");
+    LogMessage(L"[+] HostGuard 主引擎启动完毕，进程裁决与驱动遥测管线已启动；当前仅保留进程与注册表防护。");
 
     while (!WaitForShutdown(1000)) {
     }
@@ -1903,6 +2112,15 @@ int wmain(int argc, wchar_t* argv[]) {
             return RunStatusCommand(rulesPath);
         }
 
+        if ((_wcsicmp(argv[1], L"terminate") == 0 || _wcsicmp(argv[1], L"kill") == 0) && argc > 2) {
+            return RunTerminateProcessCommand(argv[2]);
+        }
+
+        if (_wcsicmp(argv[1], L"terminate") == 0 || _wcsicmp(argv[1], L"kill") == 0) {
+            std::wcerr << L"[-] 错误：缺少 PID 参数，例如：HostGuard.exe terminate 1234" << std::endl;
+            return 1;
+        }
+
         if (_wcsicmp(argv[1], L"help") == 0 || _wcsicmp(argv[1], L"--help") == 0 || _wcsicmp(argv[1], L"/?") == 0) {
             std::wcout << L"Usage:" << std::endl;
             std::wcout << L"  HostGuard.exe              启动实时防护或由 SCM 拉起服务" << std::endl;
@@ -1911,6 +2129,7 @@ int wmain(int argc, wchar_t* argv[]) {
             std::wcout << L"  HostGuard.exe stop         停止 HostGuard 服务" << std::endl;
             std::wcout << L"  HostGuard.exe uninstall    卸载 HostGuard 服务" << std::endl;
             std::wcout << L"  HostGuard.exe status       查看规则和驱动状态" << std::endl;
+            std::wcout << L"  HostGuard.exe terminate PID 通过驱动强制终止目标进程" << std::endl;
             return 0;
         }
     }
@@ -1922,3 +2141,7 @@ int wmain(int argc, wchar_t* argv[]) {
 
     return RunProtectionEngine(false);
 }
+
+
+
+

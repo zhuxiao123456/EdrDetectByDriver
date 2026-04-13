@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <mutex>
 #include <regex>
 #include <string>
@@ -15,10 +15,10 @@ struct DetectionRule {
     std::wstring id;
     std::wstring threatDesc;
     int severity = 0;
-    RuleRegexGroup parentProcessRules;  // position: 1
-    RuleRegexGroup childProcessRules;   // position: 2
-    RuleRegexGroup cmdLineRules;        // position: 3
-    RuleRegexGroup parentCmdLineRules;  // position: 4
+    RuleRegexGroup parentProcessRules;
+    RuleRegexGroup childProcessRules;
+    RuleRegexGroup cmdLineRules;
+    RuleRegexGroup parentCmdLineRules;
 };
 
 struct RegistryRuleField {
@@ -39,14 +39,10 @@ struct RegistryRuleDefinition {
     RegistryRuleField valueDataRule;
 };
 
-struct FileRuleDefinition {
-    std::wstring id;
-    std::wstring threatDesc;
-    int severity = 0;
-    ULONG operation = FILE_OPERATION_CREATE_OR_WRITE;
-    RegistryRuleField processNameRule;
-    RegistryRuleField targetPathRule;
-    RegistryRuleField extensionRule;
+struct AutoResponseConfiguration {
+    bool terminateOnRegistryBlock = false;
+    int minSeverity = 0;
+    ULONG cooldownMs = 5000;
 };
 
 struct RuleConfiguration {
@@ -57,11 +53,9 @@ struct RuleConfiguration {
     ULONG processVerdictTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
     ULONG processVerdictFailMode = PROCESS_VERDICT_FAIL_OPEN;
     ULONG captureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
+    AutoResponseConfiguration autoResponse;
     std::vector<DetectionRule> processRules;
     std::vector<DetectionRule> processAllowRules;
-    std::vector<std::wstring> driverBlacklist;
-    std::vector<FileRuleDefinition> fileRuleDefinitions;
-    std::vector<FILE_RULE> fileRules;
     std::vector<RegistryRuleDefinition> registryRuleDefinitions;
     std::vector<REGISTRY_RULE> registryRules;
     std::vector<RegistryRuleDefinition> registryAllowRuleDefinitions;
@@ -100,19 +94,10 @@ public:
     size_t GetProcessAllowRuleCount() const;
     size_t GetRegistryRuleCount() const;
     size_t GetRegistryAllowRuleCount() const;
-    size_t GetDriverBlacklistCount() const;
-    size_t GetFileRuleCount() const;
-    std::vector<std::wstring> GetDriverBlacklist() const;
-    std::vector<FILE_RULE> GetFileRules() const;
     std::vector<REGISTRY_RULE> GetRegistryRules() const;
     std::vector<REGISTRY_RULE> GetRegistryAllowRules() const;
     std::wstring GetConfigVersion() const;
     std::wstring GetProfileName() const;
-    bool TryGetFileRuleMetadata(
-        const std::wstring& ruleId,
-        std::wstring& outThreatDesc,
-        int& outSeverity
-    ) const;
     bool TryGetRegistryRuleMetadata(
         const std::wstring& ruleId,
         std::wstring& outThreatDesc,
@@ -122,6 +107,4 @@ public:
 private:
     mutable std::mutex m_Lock;
     RuleConfiguration m_ActiveConfig;
-
-    std::wstring Utf8ToWString(const std::string& utf8Str);
 };

@@ -526,104 +526,6 @@ bool UnloadKernelDriver(const std::wstring& serviceName) {
     return success;
 }
 
-bool AddDriverRule(HANDLE hDevice, const std::wstring& driverName) {
-    if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
-        std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
-        return false;
-    }
-
-    if (driverName.length() >= MAX_RULE_LENGTH) {
-        std::wcerr << L"[-] 错误：规则字符串过长，超过最大限制 (" << MAX_RULE_LENGTH << L")" << std::endl;
-        return false;
-    }
-
-    BLACKLIST_RULE rule;
-    ZeroMemory(&rule, sizeof(BLACKLIST_RULE));
-    wcscpy_s(rule.DriverName, MAX_RULE_LENGTH, driverName.c_str());
-
-    DWORD bytesReturned = 0;
-    BOOL result = DeviceIoControl(
-        hDevice,
-        IOCTL_ADD_DRIVER_RULE,
-        &rule,
-        sizeof(BLACKLIST_RULE),
-        NULL,
-        0,
-        &bytesReturned,
-        NULL
-    );
-
-    if (!result) {
-        std::wcerr << L"[-] 错误：下发规则失败，IOCTL 拒绝 (错误码: " << GetLastError() << L")" << std::endl;
-        return false;
-    }
-    return true;
-}
-
-bool ClearDriverRules(HANDLE hDevice) {
-    if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
-        std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
-        return false;
-    }
-
-    DWORD bytesReturned = 0;
-    BOOL result = DeviceIoControl(hDevice, IOCTL_CLEAR_DRIVER_RULES, NULL, 0, NULL, 0, &bytesReturned, NULL);
-
-    if (!result) {
-        std::wcerr << L"[-] 错误：清空规则失败 (错误码: " << GetLastError() << L")" << std::endl;
-        return false;
-    }
-    return true;
-}
-
-bool AddFileRule(HANDLE hDevice, const FILE_RULE& inputRule) {
-    if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
-        std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
-        return false;
-    }
-
-    FILE_RULE rule = inputRule;
-    rule.RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
-    rule.ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
-    rule.TargetPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
-    rule.Extension[MAX_RULE_LENGTH - 1] = L'\0';
-
-    DWORD bytesReturned = 0;
-    BOOL result = DeviceIoControl(
-        hDevice,
-        IOCTL_ADD_FILE_RULE,
-        &rule,
-        sizeof(FILE_RULE),
-        NULL,
-        0,
-        &bytesReturned,
-        NULL);
-
-    if (!result) {
-        std::wcerr << L"[-] 错误：下发文件规则失败，IOCTL 拒绝 (错误码: " << GetLastError() << L")" << std::endl;
-        return false;
-    }
-
-    return true;
-}
-
-bool ClearFileRules(HANDLE hDevice) {
-    if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
-        std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
-        return false;
-    }
-
-    DWORD bytesReturned = 0;
-    BOOL result = DeviceIoControl(hDevice, IOCTL_CLEAR_FILE_RULES, NULL, 0, NULL, 0, &bytesReturned, NULL);
-
-    if (!result) {
-        std::wcerr << L"[-] 错误：清空文件规则失败 (错误码: " << GetLastError() << L")" << std::endl;
-        return false;
-    }
-
-    return true;
-}
-
 bool AddRegistryRule(HANDLE hDevice, const REGISTRY_RULE& inputRule) {
     if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
         std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
@@ -753,6 +655,54 @@ bool QueryDriverStatus(HANDLE hDevice, DRIVER_RUNTIME_STATUS& outStatus) {
     return true;
 }
 
+bool TerminateTargetProcess(HANDLE hDevice, DWORD processId, LONG exitStatus, DWORD* outErrorCode) {
+    if (outErrorCode != nullptr) {
+        *outErrorCode = ERROR_SUCCESS;
+    }
+
+    if (hDevice == INVALID_HANDLE_VALUE || hDevice == NULL) {
+        std::wcerr << L"[-] 错误：传入的驱动通信句柄无效！" << std::endl;
+        if (outErrorCode != nullptr) {
+            *outErrorCode = ERROR_INVALID_HANDLE;
+        }
+        return false;
+    }
+
+    if (processId == 0) {
+        std::wcerr << L"[-] 错误：目标 PID 无效。" << std::endl;
+        if (outErrorCode != nullptr) {
+            *outErrorCode = ERROR_INVALID_PARAMETER;
+        }
+        return false;
+    }
+
+    EDR_TERMINATE_PROCESS_REQUEST request = {};
+    request.ProcessId = processId;
+    request.ExitStatus = exitStatus;
+
+    DWORD bytesReturned = 0;
+    BOOL result = DeviceIoControl(
+        hDevice,
+        IOCTL_EDR_TERMINATE_PROCESS,
+        &request,
+        sizeof(request),
+        NULL,
+        0,
+        &bytesReturned,
+        NULL);
+
+    if (!result) {
+        DWORD errorCode = GetLastError();
+        if (outErrorCode != nullptr) {
+            *outErrorCode = errorCode;
+        }
+        std::wcerr << L"[-] 错误：内核终止进程失败 (错误码: " << errorCode << L")" << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
 bool SetActiveDriverConfigInfo(
     HANDLE hDevice,
     const std::wstring& configVersion,
@@ -781,6 +731,9 @@ bool SetActiveDriverConfigInfo(
     configInfo.ProcessVerdictFailMode = processVerdictFailMode;
     configInfo.CaptureParentCommandLine = captureParentCommandLine;
 
+
+
+
     DWORD bytesReturned = 0;
     BOOL result = DeviceIoControl(
         hDevice,
@@ -799,3 +752,4 @@ bool SetActiveDriverConfigInfo(
 
     return true;
 }
+
