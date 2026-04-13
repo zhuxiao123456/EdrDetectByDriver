@@ -1,4 +1,4 @@
-#define POOL_ZERO_DOWN_LEVEL_SUPPORT
+﻿#define POOL_ZERO_DOWN_LEVEL_SUPPORT
 #include "PebMonitor.h"
 
 typedef struct _RTL_USER_PROCESS_PARAMETERS_LITE {
@@ -17,7 +17,6 @@ typedef struct _PEB_LITE {
 } PEB_LITE, *PPEB_LITE;
 
 EXTERN_C PVOID PsGetProcessPeb(_In_ PEPROCESS Process);
-EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 static VOID CopyUnicodeStringToFixedBuffer(
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -131,13 +130,15 @@ static VOID QueueKernelEvent(
     _In_opt_z_ PCWSTR infoClass,
     _In_opt_ PCUNICODE_STRING valueName,
     _In_opt_z_ PCWSTR valueData) {
+    UNREFERENCED_PARAMETER(fileOperation);
+
     PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
     if (!node) {
+        InterlockedIncrement64(&g_DriverEventAllocFailCount);
         return;
     }
     node->EventData.EventType = eventType;
     node->EventData.RegistryOperation = registryOperation;
-    node->EventData.FileOperation = fileOperation;
     node->EventData.ProcessId = processId;
     node->EventData.Severity = severity;
     CopyWideStringToFixedBuffer(node->EventData.ProcessName, RTL_NUMBER_OF(node->EventData.ProcessName), processName);
@@ -168,6 +169,7 @@ static VOID QueueKernelEvent(
         }
     }
     else {
+        InterlockedIncrement64(&g_DriverEventDropCount);
         FreeDriverEventNode(node);
         node = NULL;
     }
@@ -183,7 +185,6 @@ static VOID QueueKernelEvent(
 }
 
 const FLT_OPERATION_REGISTRATION g_FilterOperationCallbacks[] = {
-    { IRP_MJ_CREATE, 0, FilePreCreateOperation, NULL },
     { IRP_MJ_OPERATION_END }
 };
 
@@ -420,46 +421,6 @@ static VOID GetCurrentProcessName(
 
     buffer[i] = L'\0';
     ExFreePool(imagePath);
-}
-
-static BOOLEAN GetCurrentProcessNameFast(
-    _Out_writes_(bufferLength) WCHAR* buffer,
-    _In_ SIZE_T bufferLength) {
-    if (buffer == NULL || bufferLength == 0) {
-        return FALSE;
-    }
-
-    buffer[0] = L'\0';
-
-    PCHAR ansiName = PsGetProcessImageFileName(PsGetCurrentProcess());
-    if (ansiName == NULL) {
-        return FALSE;
-    }
-
-    SIZE_T copied = 0;
-    while (copied + 1 < bufferLength && copied < 15) {
-        CHAR ch = ansiName[copied];
-        if (ch == '\0') {
-            break;
-        }
-
-        if (ch >= 'A' && ch <= 'Z') {
-            ch = (CHAR)(ch - 'A' + 'a');
-        }
-        buffer[copied] = (WCHAR)(UCHAR)ch;
-        copied++;
-    }
-
-    // PsGetProcessImageFileName only exposes a 15-byte ANSI name slot.
-    // When we hit this boundary, treat it as potentially truncated and
-    // force the caller to fall back to full path-based name capture.
-    if (copied >= 15) {
-        buffer[0] = L'\0';
-        return FALSE;
-    }
-
-    buffer[copied] = L'\0';
-    return copied > 0;
 }
 
 static VOID CaptureProcessImagePath(
@@ -918,292 +879,9 @@ static BOOLEAN MatchRegistryRule(
     return TRUE;
 }
 
-static BOOLEAN MatchFileRule(
-    _In_ const FILE_RULE* rule,
-    _In_ ULONG actualOperation,
-    _In_opt_z_ PCWSTR processName,
-    _In_opt_z_ PCWSTR targetPath,
-    _In_opt_z_ PCWSTR extension) {
-    if (rule == NULL) {
-        return FALSE;
-    }
-
-    if (rule->Operation == FILE_OPERATION_CREATE && actualOperation != FILE_OPERATION_CREATE) {
-        return FALSE;
-    }
-
-    if (rule->Operation == FILE_OPERATION_WRITE && actualOperation != FILE_OPERATION_WRITE) {
-        return FALSE;
-    }
-
-    if ((rule->MatchFlags & FILE_MATCH_FLAG_PROCESS_NAME) &&
-        !MatchRegistryField(rule->ProcessNameMatchType, rule->ProcessName, processName)) {
-        return FALSE;
-    }
-
-    if ((rule->MatchFlags & FILE_MATCH_FLAG_TARGET_PATH) &&
-        !MatchRegistryField(rule->TargetPathMatchType, rule->TargetPath, targetPath)) {
-        return FALSE;
-    }
-
-    if ((rule->MatchFlags & FILE_MATCH_FLAG_EXTENSION) &&
-        !MatchRegistryField(rule->ExtensionMatchType, rule->Extension, extension)) {
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-static BOOLEAN MatchFileRuleWithoutProcess(
-    _In_ const FILE_RULE* rule,
-    _In_ ULONG actualOperation,
-    _In_opt_z_ PCWSTR targetPath,
-    _In_opt_z_ PCWSTR extension) {
-    if (rule == NULL) {
-        return FALSE;
-    }
-
-    if (rule->Operation == FILE_OPERATION_CREATE && actualOperation != FILE_OPERATION_CREATE) {
-        return FALSE;
-    }
-
-    if (rule->Operation == FILE_OPERATION_WRITE && actualOperation != FILE_OPERATION_WRITE) {
-        return FALSE;
-    }
-
-    if ((rule->MatchFlags & FILE_MATCH_FLAG_TARGET_PATH) &&
-        !MatchRegistryField(rule->TargetPathMatchType, rule->TargetPath, targetPath)) {
-        return FALSE;
-    }
-
-    if ((rule->MatchFlags & FILE_MATCH_FLAG_EXTENSION) &&
-        !MatchRegistryField(rule->ExtensionMatchType, rule->Extension, extension)) {
-        return FALSE;
-    }
-
-    return TRUE;
-}
-
-static ULONG DetermineFileOperationFromCreate(_In_ PFLT_CALLBACK_DATA Data) {
-    if (Data == NULL || Data->Iopb == NULL) {
-        return 0;
-    }
-
-    ACCESS_MASK desiredAccess = Data->Iopb->Parameters.Create.SecurityContext->DesiredAccess;
-    ULONG disposition = (Data->Iopb->Parameters.Create.Options >> 24) & 0xFF;
-    BOOLEAN hasWriteAccess =
-        (desiredAccess & (FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | DELETE)) != 0 ||
-        (desiredAccess & (GENERIC_WRITE | GENERIC_ALL)) != 0;
-    BOOLEAN isCreateStyle =
-        disposition == FILE_SUPERSEDE ||
-        disposition == FILE_CREATE ||
-        disposition == FILE_OPEN_IF ||
-        disposition == FILE_OVERWRITE ||
-        disposition == FILE_OVERWRITE_IF;
-
-    if (isCreateStyle) {
-        return FILE_OPERATION_CREATE;
-    }
-
-    if (hasWriteAccess) {
-        return FILE_OPERATION_WRITE;
-    }
-
-    return 0;
-}
-
-static VOID ExtractFileExtensionFromPath(
-    _In_opt_z_ PCWSTR targetPath,
-    _Out_writes_(bufferLength) WCHAR* buffer,
-    _In_ SIZE_T bufferLength) {
-    if (buffer == NULL || bufferLength == 0) {
-        return;
-    }
-
-    buffer[0] = L'\0';
-    if (targetPath == NULL || targetPath[0] == L'\0') {
-        return;
-    }
-
-    const WCHAR* lastSlash = wcsrchr(targetPath, L'\\');
-    const WCHAR* lastForwardSlash = wcsrchr(targetPath, L'/');
-    const WCHAR* start = targetPath;
-    if (lastSlash != NULL && lastSlash + 1 > start) {
-        start = lastSlash + 1;
-    }
-    if (lastForwardSlash != NULL && lastForwardSlash + 1 > start) {
-        start = lastForwardSlash + 1;
-    }
-
-    const WCHAR* lastDot = wcsrchr(start, L'.');
-    if (lastDot == NULL || lastDot[0] == L'\0') {
-        return;
-    }
-
-    RtlStringCchCopyW(buffer, bufferLength, lastDot);
-}
-
 NTSTATUS FileFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags) {
     UNREFERENCED_PARAMETER(Flags);
     return STATUS_SUCCESS;
-}
-
-FLT_PREOP_CALLBACK_STATUS FilePreCreateOperation(
-    _Inout_ PFLT_CALLBACK_DATA Data,
-    _In_ PCFLT_RELATED_OBJECTS FltObjects,
-    _Flt_CompletionContext_Outptr_ PVOID* CompletionContext) {
-    UNREFERENCED_PARAMETER(CompletionContext);
-
-    if (!ExAcquireRundownProtection(&g_RundownRef)) {
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    if (Data == NULL || Data->Iopb == NULL || FltObjects == NULL || Data->RequestorMode == KernelMode) {
-        ExReleaseRundownProtection(&g_RundownRef);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    const ULONG fileOperation = DetermineFileOperationFromCreate(Data);
-    if (fileOperation == 0) {
-        ExReleaseRundownProtection(&g_RundownRef);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    {
-        BOOLEAN hasRules = FALSE;
-        AcquireSharedPushLock(&g_FileRuleLock);
-        hasRules = (g_FileRuleCount != 0);
-        ReleaseSharedPushLock(&g_FileRuleLock);
-        if (!hasRules) {
-            ExReleaseRundownProtection(&g_RundownRef);
-            return FLT_PREOP_SUCCESS_NO_CALLBACK;
-        }
-    }
-
-    WCHAR processName[MAX_RULE_LENGTH];
-    WCHAR targetPathBuffer[MAX_REG_PATH_LENGTH];
-    WCHAR extensionBuffer[MAX_RULE_LENGTH];
-    WCHAR matchedRuleId[MAX_RULE_ID_LENGTH];
-    ULONG matchedRuleSeverity = 0;
-    BOOLEAN ruleMatched = FALSE;
-    BOOLEAN needProcessCheck = FALSE;
-    BOOLEAN processNameResolved = FALSE;
-
-    processName[0] = L'\0';
-    targetPathBuffer[0] = L'\0';
-    extensionBuffer[0] = L'\0';
-    matchedRuleId[0] = L'\0';
-
-    PFLT_FILE_NAME_INFORMATION fileNameInfo = NULL;
-    if (NT_SUCCESS(FltGetFileNameInformation(
-        Data,
-        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
-        &fileNameInfo)) && fileNameInfo != NULL) {
-        FltParseFileNameInformation(fileNameInfo);
-        CopyUnicodeStringToFixedBuffer(targetPathBuffer, RTL_NUMBER_OF(targetPathBuffer), &fileNameInfo->Name);
-        if (fileNameInfo->Extension.Length > 0) {
-            CopyUnicodeStringToFixedBuffer(extensionBuffer, RTL_NUMBER_OF(extensionBuffer), &fileNameInfo->Extension);
-            if (extensionBuffer[0] != L'\0' && extensionBuffer[0] != L'.') {
-                WCHAR extensionWithDot[MAX_RULE_LENGTH];
-                RtlStringCchPrintfW(extensionWithDot, RTL_NUMBER_OF(extensionWithDot), L".%ws", extensionBuffer);
-                RtlStringCchCopyW(extensionBuffer, RTL_NUMBER_OF(extensionBuffer), extensionWithDot);
-            }
-        }
-        FltReleaseFileNameInformation(fileNameInfo);
-    }
-    else if (FltObjects->FileObject != NULL && FltObjects->FileObject->FileName.Buffer != NULL) {
-        CopyUnicodeStringToFixedBuffer(targetPathBuffer, RTL_NUMBER_OF(targetPathBuffer), &FltObjects->FileObject->FileName);
-    }
-
-    if (extensionBuffer[0] == L'\0') {
-        ExtractFileExtensionFromPath(targetPathBuffer, extensionBuffer, RTL_NUMBER_OF(extensionBuffer));
-    }
-
-    AcquireSharedPushLock(&g_FileRuleLock);
-    for (ULONG i = 0; i < g_FileRuleCount; ++i) {
-        if (MatchFileRuleWithoutProcess(&g_FileRules[i], fileOperation, targetPathBuffer, extensionBuffer)) {
-            if ((g_FileRules[i].MatchFlags & FILE_MATCH_FLAG_PROCESS_NAME) == 0) {
-                CopyWideStringToFixedBuffer(
-                    matchedRuleId,
-                    RTL_NUMBER_OF(matchedRuleId),
-                    g_FileRules[i].RuleId);
-                matchedRuleSeverity = g_FileRules[i].Severity;
-                ruleMatched = TRUE;
-                break;
-            }
-
-            needProcessCheck = TRUE;
-        }
-    }
-    ReleaseSharedPushLock(&g_FileRuleLock);
-
-    if (!ruleMatched && !needProcessCheck) {
-        ExReleaseRundownProtection(&g_RundownRef);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    if (!ruleMatched && needProcessCheck) {
-        if (!processNameResolved) {
-            if (!GetCurrentProcessNameFast(processName, RTL_NUMBER_OF(processName))) {
-                GetCurrentProcessName(processName, RTL_NUMBER_OF(processName));
-            }
-            processNameResolved = TRUE;
-        }
-
-        AcquireSharedPushLock(&g_FileRuleLock);
-        for (ULONG i = 0; i < g_FileRuleCount; ++i) {
-            if ((g_FileRules[i].MatchFlags & FILE_MATCH_FLAG_PROCESS_NAME) == 0) {
-                continue;
-            }
-
-            if (!MatchFileRuleWithoutProcess(&g_FileRules[i], fileOperation, targetPathBuffer, extensionBuffer)) {
-                continue;
-            }
-
-            if (MatchFileRule(&g_FileRules[i], fileOperation, processName, targetPathBuffer, extensionBuffer)) {
-                CopyWideStringToFixedBuffer(
-                    matchedRuleId,
-                    RTL_NUMBER_OF(matchedRuleId),
-                    g_FileRules[i].RuleId);
-                matchedRuleSeverity = g_FileRules[i].Severity;
-                ruleMatched = TRUE;
-                break;
-            }
-        }
-        ReleaseSharedPushLock(&g_FileRuleLock);
-    }
-
-    if (!ruleMatched) {
-        ExReleaseRundownProtection(&g_RundownRef);
-        return FLT_PREOP_SUCCESS_NO_CALLBACK;
-    }
-
-    UNICODE_STRING targetPath;
-    RtlInitUnicodeString(&targetPath, targetPathBuffer);
-
-    KdPrint(("[EDR] Blocked file operation. Operation=%lu RuleId=%ws Process=%ws Path=%ws\n",
-        fileOperation,
-        matchedRuleId,
-        processName,
-        targetPathBuffer));
-
-    QueueKernelEvent(
-        DRIVER_EVENT_TYPE_BLOCKED_FILE_OPERATION,
-        0,
-        fileOperation,
-        HandleToULong(PsGetCurrentProcessId()),
-        processName,
-        matchedRuleId,
-        matchedRuleSeverity,
-        &targetPath,
-        NULL,
-        NULL,
-        extensionBuffer);
-
-    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-    Data->IoStatus.Information = 0;
-    ExReleaseRundownProtection(&g_RundownRef);
-    return FLT_PREOP_COMPLETE;
 }
 
 NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_ PVOID Argument2) {
@@ -1260,49 +938,6 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
 
         ExtractRegistryValueDataString(info->Type, info->Data, info->DataSize, valueDataBuffer, RTL_NUMBER_OF(valueDataBuffer));
 
-        if (info->ValueName != NULL && info->Data != NULL && info->DataSize > 0) {
-            UNICODE_STRING targetValueName;
-            RtlInitUnicodeString(&targetValueName, L"ImagePath");
-
-            if (RtlCompareUnicodeString(info->ValueName, &targetValueName, TRUE) == 0 &&
-                (info->Type == REG_SZ || info->Type == REG_EXPAND_SZ)) {
-                WCHAR capturedImagePathBuffer[MAX_REG_PATH_LENGTH];
-                UNICODE_STRING imagePath;
-                BOOLEAN isMalicious = FALSE;
-
-                RtlZeroMemory(capturedImagePathBuffer, sizeof(capturedImagePathBuffer));
-                if (!CaptureRegistryUnicodeString(
-                    info->Data,
-                    info->DataSize,
-                    capturedImagePathBuffer,
-                    RTL_NUMBER_OF(capturedImagePathBuffer),
-                    &imagePath)) {
-                    break;
-                }
-
-                AcquireSharedPushLock(&g_BlacklistLock);
-                isMalicious = MatchDriverBlacklistRuleLocked(&imagePath);
-                ReleaseSharedPushLock(&g_BlacklistLock);
-
-                if (isMalicious) {
-                    KdPrint(("[EDR] Blocked malicious driver service registration: %wZ\n", &imagePath));
-                        QueueKernelEvent(
-                            DRIVER_EVENT_TYPE_BLOCKED_SERVICE,
-                            0,
-                            0,
-                            HandleToULong(PsGetCurrentProcessId()),
-                            processName,
-                            NULL,
-                            0,
-                            &imagePath,
-                            NULL,
-                            info->ValueName,
-                            valueDataBuffer);
-                    status = STATUS_ACCESS_DENIED;
-                    goto Cleanup;
-                }
-            }
-        }
         break;
     }
 
@@ -1656,41 +1291,3 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     ExReleaseRundownProtection(&g_RundownRef);
 }
 
-VOID ImageNotifyCallback(_In_opt_ PUNICODE_STRING FullImageName, _In_ HANDLE ProcessId, _In_ PIMAGE_INFO ImageInfo) {
-    UNREFERENCED_PARAMETER(ProcessId);
-    if (FullImageName == NULL || FullImageName->Buffer == NULL || ImageInfo->SystemModeImage == 0) {
-        return;
-    }
-
-    WCHAR capturedImagePathBuffer[MAX_REG_PATH_LENGTH];
-    UNICODE_STRING capturedImagePath;
-    BOOLEAN isMalicious = FALSE;
-
-    if (!CaptureUnicodeStringToLocalBuffer(
-        FullImageName,
-        capturedImagePathBuffer,
-        RTL_NUMBER_OF(capturedImagePathBuffer),
-        &capturedImagePath)) {
-        return;
-    }
-
-    AcquireSharedPushLock(&g_BlacklistLock);
-    isMalicious = MatchDriverBlacklistRuleLocked(&capturedImagePath);
-    ReleaseSharedPushLock(&g_BlacklistLock);
-
-    if (isMalicious) {
-        KdPrint(("[EDR] Observed suspicious driver load: %wZ\n", &capturedImagePath));
-        QueueKernelEvent(
-            DRIVER_EVENT_TYPE_OBSERVED_LOAD,
-            0,
-            0,
-            0,
-            NULL,
-            NULL,
-            0,
-            &capturedImagePath,
-            NULL,
-            NULL,
-            NULL);
-    }
-}

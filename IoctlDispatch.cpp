@@ -1,4 +1,219 @@
-#include "PebMonitor.h"
+﻿#include "PebMonitor.h"
+
+EXTERN_C POBJECT_TYPE* PsProcessType;
+EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
+
+static ULONGLONG ReadInterlockedCounter64(_In_ volatile LONG64* counter) {
+    return (ULONGLONG)InterlockedCompareExchange64(counter, 0, 0);
+}
+
+static CHAR ToLowerAnsiCharacter(_In_ CHAR character) {
+    if (character >= 'A' && character <= 'Z') {
+        return (CHAR)(character - 'A' + 'a');
+    }
+
+    return character;
+}
+
+static BOOLEAN AsciiEqualsInsensitive(_In_opt_z_ PCSTR left, _In_opt_z_ PCSTR right) {
+    if (left == NULL || right == NULL) {
+        return FALSE;
+    }
+
+    ULONG index = 0;
+    while (left[index] != '\0' && right[index] != '\0') {
+        if (ToLowerAnsiCharacter(left[index]) != ToLowerAnsiCharacter(right[index])) {
+            return FALSE;
+        }
+        index++;
+    }
+
+    return left[index] == '\0' && right[index] == '\0';
+}
+
+static VOID CopyAnsiStringToWideBuffer(
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_opt_z_ PCSTR source) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    if (source == NULL) {
+        return;
+    }
+
+    SIZE_T index = 0;
+    while (index + 1 < bufferLength && source[index] != '\0') {
+        CHAR character = ToLowerAnsiCharacter(source[index]);
+        buffer[index] = (WCHAR)(UCHAR)character;
+        index++;
+    }
+
+    buffer[index] = L'\0';
+}
+
+static VOID CopyAnsiStringToFixedBuffer(
+    _Out_writes_(bufferLength) CHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_opt_z_ PCSTR source) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = '\0';
+    if (source == NULL) {
+        return;
+    }
+
+    SIZE_T index = 0;
+    while (index + 1 < bufferLength && source[index] != '\0') {
+        buffer[index] = source[index];
+        index++;
+    }
+
+    buffer[index] = '\0';
+}
+
+static VOID QueueResponseActionEvent(
+    _In_ ULONG responseAction,
+    _In_ ULONG processId,
+    _In_opt_z_ PCSTR processNameAnsi,
+    _In_ NTSTATUS responseStatus) {
+    PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
+    if (node == NULL) {
+        InterlockedIncrement64(&g_DriverEventAllocFailCount);
+        return;
+    }
+
+    node->EventData.EventType = DRIVER_EVENT_TYPE_RESPONSE_ACTION;
+    node->EventData.ProcessId = processId;
+    node->EventData.ResponseAction = responseAction;
+    node->EventData.ResponseStatus = responseStatus;
+    CopyAnsiStringToWideBuffer(
+        node->EventData.ProcessName,
+        RTL_NUMBER_OF(node->EventData.ProcessName),
+        processNameAnsi);
+
+    KIRQL oldIrql;
+    PIRP irpToComplete = NULL;
+
+    KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);
+    if (g_DriverEventCount < MAX_EVENT_COUNT) {
+        InsertTailList(&g_DriverEventQueue, &node->ListEntry);
+        g_DriverEventCount++;
+
+        if (g_PendingDriverIrp != NULL) {
+            if (IoSetCancelRoutine(g_PendingDriverIrp, NULL)) {
+                irpToComplete = g_PendingDriverIrp;
+                g_PendingDriverIrp = NULL;
+                RemoveEntryList(&node->ListEntry);
+                g_DriverEventCount--;
+            }
+            else {
+                g_PendingDriverIrp = NULL;
+            }
+        }
+    }
+    else {
+        InterlockedIncrement64(&g_DriverEventDropCount);
+        FreeDriverEventNode(node);
+        node = NULL;
+    }
+    KeReleaseSpinLock(&g_DriverQueueLock, oldIrql);
+
+    if (irpToComplete != NULL && node != NULL) {
+        RtlCopyMemory(irpToComplete->AssociatedIrp.SystemBuffer, &node->EventData, sizeof(DRIVER_EVENT));
+        irpToComplete->IoStatus.Information = sizeof(DRIVER_EVENT);
+        irpToComplete->IoStatus.Status = STATUS_SUCCESS;
+        IoCompleteRequest(irpToComplete, IO_NO_INCREMENT);
+        FreeDriverEventNode(node);
+    }
+}
+
+static BOOLEAN IsProtectedTargetProcess(_In_ ULONG processId, _In_opt_z_ PCSTR imageName) {
+    static const CHAR* const protectedNames[] = {
+        "system",
+        "smss.exe",
+        "csrss.exe",
+        "wininit.exe",
+        "winlogon.exe",
+        "services.exe",
+        "lsass.exe"
+    };
+
+    if (processId == 0 || processId == 4) {
+        return TRUE;
+    }
+
+    if (imageName == NULL || imageName[0] == '\0') {
+        return FALSE;
+    }
+
+    for (ULONG index = 0; index < RTL_NUMBER_OF(protectedNames); ++index) {
+        if (AsciiEqualsInsensitive(imageName, protectedNames[index])) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static NTSTATUS TerminateTargetProcessById(_In_ ULONG processId, _In_ LONG exitStatus) {
+    if (processId == 0) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    PEPROCESS process = NULL;
+    NTSTATUS status = PsLookupProcessByProcessId(ULongToHandle(processId), &process);
+    if (!NT_SUCCESS(status)) {
+        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, NULL, status);
+        return status;
+    }
+
+    PCHAR imageName = PsGetProcessImageFileName(process);
+    CHAR imageNameCopy[16] = {};
+    CopyAnsiStringToFixedBuffer(imageNameCopy, RTL_NUMBER_OF(imageNameCopy), imageName);
+
+    if (IsProtectedTargetProcess(processId, imageNameCopy)) {
+        KdPrint(("[PebMonitor] WARN: Rejecting terminate request for protected process. PID=%lu Image=%s\n",
+            processId,
+            (imageNameCopy[0] != '\0') ? imageNameCopy : "<unknown>"));
+        ObDereferenceObject(process);
+        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameCopy, STATUS_ACCESS_DENIED);
+        return STATUS_ACCESS_DENIED;
+    }
+
+    HANDLE processHandle = NULL;
+    status = ObOpenObjectByPointer(
+        process,
+        OBJ_KERNEL_HANDLE,
+        NULL,
+        PROCESS_TERMINATE,
+        *PsProcessType,
+        KernelMode,
+        &processHandle);
+    ObDereferenceObject(process);
+
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("[PebMonitor] WARN: Failed to open process for terminate. PID=%lu Status=0x%08X\n",
+            processId,
+            status));
+        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameCopy, status);
+        return status;
+    }
+
+    status = ZwTerminateProcess(processHandle, exitStatus);
+    ZwClose(processHandle);
+
+    KdPrint(("[PebMonitor] INFO: Terminate process request completed. PID=%lu Status=0x%08X ExitStatus=0x%08X\n",
+        processId,
+        status,
+        (ULONG)exitStatus));
+    QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameCopy, status);
+    return status;
+}
 
 static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) {
     RtlZeroMemory(runtimeStatus, sizeof(DRIVER_RUNTIME_STATUS));
@@ -20,14 +235,6 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
     RtlStringCchCopyW(runtimeStatus->GeneratedAt, RTL_NUMBER_OF(runtimeStatus->GeneratedAt), g_ActiveGeneratedAt);
     ReleaseSharedPushLock(&g_RuntimeStatusLock);
 
-    AcquireSharedPushLock(&g_BlacklistLock);
-    runtimeStatus->DriverBlacklistCount = g_BlacklistCount;
-    ReleaseSharedPushLock(&g_BlacklistLock);
-
-    AcquireSharedPushLock(&g_FileRuleLock);
-    runtimeStatus->FileRuleCount = g_FileRuleCount;
-    ReleaseSharedPushLock(&g_FileRuleLock);
-
     AcquireSharedPushLock(&g_RegistryRuleLock);
     runtimeStatus->RegistryRuleCount = g_RegistryRuleCount;
     ReleaseSharedPushLock(&g_RegistryRuleLock);
@@ -40,6 +247,9 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
     KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);
     runtimeStatus->DriverEventQueueCount = g_DriverEventCount;
     KeReleaseSpinLock(&g_DriverQueueLock, oldIrql);
+
+    runtimeStatus->DriverEventDropCount = ReadInterlockedCounter64(&g_DriverEventDropCount);
+    runtimeStatus->DriverEventAllocFailCount = ReadInterlockedCounter64(&g_DriverEventAllocFailCount);
 }
 
 VOID CancelPendingDriverIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
@@ -131,6 +341,19 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         break;
     }
 
+    case IOCTL_EDR_TERMINATE_PROCESS: {
+        if (inBufLength < sizeof(EDR_TERMINATE_PROCESS_REQUEST)) {
+            status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        PEDR_TERMINATE_PROCESS_REQUEST request =
+            (PEDR_TERMINATE_PROCESS_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+        status = TerminateTargetProcessById(request->ProcessId, request->ExitStatus);
+        Irp->IoStatus.Information = 0;
+        break;
+    }
+
     case IOCTL_GET_DRIVER_EVENT: {
         if (outBufLength < sizeof(DRIVER_EVENT)) {
             status = STATUS_BUFFER_TOO_SMALL;
@@ -178,76 +401,6 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             }
             return STATUS_PENDING;
         }
-        break;
-    }
-
-    case IOCTL_ADD_DRIVER_RULE: {
-        if (inBufLength < sizeof(BLACKLIST_RULE)) {
-            status = STATUS_BUFFER_TOO_SMALL;
-            break;
-        }
-        PBLACKLIST_RULE rule = (PBLACKLIST_RULE)Irp->AssociatedIrp.SystemBuffer;
-
-        rule->DriverName[MAX_RULE_LENGTH - 1] = L'\0';
-
-        AcquireExclusivePushLock(&g_BlacklistLock);
-        if (g_BlacklistCount < MAX_BLACKLIST_ENTRIES) {
-            status = InsertDriverBlacklistRuleLocked(rule->DriverName);
-            if (NT_SUCCESS(status)) {
-                g_BlacklistCount++;
-            }
-        }
-        else {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-        ReleaseExclusivePushLock(&g_BlacklistLock);
-        Irp->IoStatus.Information = 0;
-        break;
-    }
-
-    case IOCTL_CLEAR_DRIVER_RULES: {
-        AcquireExclusivePushLock(&g_BlacklistLock);
-        ClearDriverBlacklistRulesLocked();
-        g_BlacklistCount = 0;
-        ReleaseExclusivePushLock(&g_BlacklistLock);
-        status = STATUS_SUCCESS;
-        Irp->IoStatus.Information = 0;
-        break;
-    }
-
-    case IOCTL_ADD_FILE_RULE: {
-        if (inBufLength < sizeof(FILE_RULE)) {
-            status = STATUS_BUFFER_TOO_SMALL;
-            break;
-        }
-        PFILE_RULE rule = (PFILE_RULE)Irp->AssociatedIrp.SystemBuffer;
-
-        rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
-        rule->ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->TargetPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
-        rule->Extension[MAX_RULE_LENGTH - 1] = L'\0';
-
-        AcquireExclusivePushLock(&g_FileRuleLock);
-        if (g_FileRuleCount < MAX_FILE_RULE_COUNT) {
-            RtlCopyMemory(&g_FileRules[g_FileRuleCount], rule, sizeof(FILE_RULE));
-            g_FileRuleCount++;
-            status = STATUS_SUCCESS;
-        }
-        else {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-        ReleaseExclusivePushLock(&g_FileRuleLock);
-        Irp->IoStatus.Information = 0;
-        break;
-    }
-
-    case IOCTL_CLEAR_FILE_RULES: {
-        AcquireExclusivePushLock(&g_FileRuleLock);
-        g_FileRuleCount = 0;
-        RtlZeroMemory(g_FileRules, sizeof(g_FileRules));
-        ReleaseExclusivePushLock(&g_FileRuleLock);
-        status = STATUS_SUCCESS;
-        Irp->IoStatus.Information = 0;
         break;
     }
 
