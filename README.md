@@ -1,56 +1,56 @@
 # edr_hostguard
 
-`edr_detect` branch currently tracks the pure process + registry edition of HostGuard.
+`edr_detect` 分支当前对应 HostGuard 的“纯进程 + 注册表版”用户态仓库。
 
-## Scope
+## 仓库定位
 
-This repository contains the user-mode controller for the lightweight HostGuard deployment model:
+本仓库包含轻量化 HostGuard 部署模型下的用户态控制端，负责：
 
-- loads and manages the paired kernel driver
-- pushes process verdict and registry rule configuration to the driver
-- receives process creation verdict requests through the process communication port
-- pulls registry and response telemetry events from the driver
-- supports kernel-assisted terminate response for already running processes
+- 加载并管理配套内核驱动
+- 向驱动下发进程裁决配置与注册表规则配置
+- 通过进程通信端口接收进程创建裁决请求
+- 从驱动拉取注册表事件与响应动作遥测
+- 对已运行进程执行内核辅助终止响应
 
-## Current protection surface
+## 当前防护范围
 
-Included in this branch:
+本分支当前保留：
 
-- process creation verdicting
-- process allow rules
-- registry block rules
-- registry allow rules
-- runtime status and telemetry query
+- 进程创建裁决
+- 进程白名单规则
+- 注册表拦截规则
+- 注册表白名单规则
+- 运行状态与遥测查询
 
-Removed from this branch:
+本分支当前已移除：
 
-- driver blacklist and driver verdict port
-- driver load interception
-- file rules and file interception
-- image-load based suspicious driver telemetry
+- 驱动黑名单与驱动专项裁决端口
+- 驱动加载拦截
+- 文件规则与文件拦截
+- 基于镜像加载的可疑驱动遥测
 
-## Repository layout
+## 目录说明
 
-- `HostGuard.cpp`: service and CLI entry, process verdict loop, event handling
-- `RuleManager.*`: JSON rule loading and runtime snapshots
-- `DriverUtils.*`: driver/service install and IOCTL helpers
-- `Common/PebMonitorShared.h`: shared ABI with the kernel driver
+- `HostGuard.cpp`：服务与命令行入口、进程裁决循环、事件处理
+- `RuleManager.*`：JSON 规则加载与运行时快照
+- `DriverUtils.*`：驱动/服务安装与 IOCTL 辅助函数
+- `Common/PebMonitorShared.h`：与内核驱动共享的 ABI 协议头
 
-## Build
+## 构建说明
 
-Recommended environment:
+推荐环境：
 
 - Visual Studio 2022
-- `Legacy2012 | x64` configuration
-- `nlohmann.json` NuGet package restored under `packages/`
+- `Legacy2012 | x64` 配置
+- 已还原到 `packages/` 目录下的 `nlohmann.json` NuGet 包
 
-Output binary:
+输出文件：
 
 - `x64\\Legacy2012\\HostGuard.exe`
 
-## Rules
+## 规则说明
 
-This branch expects process and registry rules only. The active schema is centered on:
+本分支当前只使用进程和注册表相关规则，核心配置段包括：
 
 - `process_rules`
 - `process_allow_rules`
@@ -59,4 +59,4 @@ This branch expects process and registry rules only. The active schema is center
 - `process_verdict`
 - `response`
 
-Driver and file specific rule sections from older branches are intentionally not used here.
+旧分支中的驱动专项规则和文件规则在这个分支里不再使用。
