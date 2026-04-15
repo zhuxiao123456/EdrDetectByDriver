@@ -1805,12 +1805,16 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     bool responseSucceeded = driverEvent.ResponseStatus >= 0;
     const bool isObservedProcessCreate = (driverEvent.EventType == DRIVER_EVENT_TYPE_OBSERVED_PROCESS_CREATE);
     const std::wstring driverEventTypeName = DriverEventTypeToString(driverEvent.EventType);
+    std::wstring parentProcessName;
 
     if (isObservedProcessCreate && processName.empty() && !targetPath.empty()) {
         processName = ExtractProcessNameFromImagePath(targetPath);
     }
     if (isObservedProcessCreate) {
         CacheProcessContext(driverEvent.ProcessId, processName, commandLine, targetPath);
+        if (parentProcessId != 0) {
+            parentProcessName = GetCachedProcessName(parentProcessId);
+        }
     }
 
     if (!ruleId.empty()) {
@@ -1888,6 +1892,9 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
         LogMessage(L"[*] 在监控模式下观测到进程创建，未进入同步裁决链路。");
         LogMessage(L"    └─ 进程 PID: " + std::to_wstring(driverEvent.ProcessId));
         LogMessage(L"    └─ 父进程 PID: " + std::to_wstring(parentProcessId));
+        if (!parentProcessName.empty()) {
+            LogMessage(L"    └─ 父进程名: " + parentProcessName);
+        }
         if (!processName.empty()) {
             LogMessage(L"    └─ 进程名: " + processName);
         }
@@ -1914,7 +1921,7 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     }
 
     json driverEventJson = BuildBaseJsonEvent(
-        isObservedProcessCreate ? "observed_process_operation" : "driver_event",
+        isObservedProcessCreate ? "observed_process_create" : "driver_event",
         (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION && responseSucceeded) ? "info" :
         (isObservedProcessCreate ? "info" : "warn"));
     driverEventJson["driver_event_type"] = driverEvent.EventType;
@@ -1928,6 +1935,9 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     }
     else if (isObservedProcessCreate) {
         driverEventJson["parent_process_id"] = parentProcessId;
+        if (!parentProcessName.empty()) {
+            driverEventJson["parent_process_name"] = WStringToUtf8(parentProcessName);
+        }
         if (!targetPath.empty()) {
             driverEventJson["image_path"] = WStringToUtf8(targetPath);
         }
