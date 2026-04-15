@@ -1,11 +1,18 @@
 ﻿#include "DriverUtils.h"
 #include <iostream>
+#include <setupapi.h>
 #include "Shared.h"
+
+#pragma comment(lib, "Setupapi.lib")
 
 namespace {
     const wchar_t kFilterLoadOrderGroup[] = L"FSFilter Activity Monitor";
     const wchar_t kFilterAltitude[] = L"370050";
     const wchar_t kFilterDependencies[] = L"FltMgr\0";
+    const wchar_t* const kDriverInfCandidateNames[] = {
+        L"DriverModule.inf",
+        L"PebMonitor.inf"
+    };
 
     bool QueryServiceStatus(SC_HANDLE hService, SERVICE_STATUS_PROCESS& status) {
         DWORD bytesNeeded = 0;
@@ -34,6 +41,77 @@ namespace {
 
         SERVICE_STATUS_PROCESS status;
         return QueryServiceStatus(hService, status) && status.dwCurrentState == expectedState;
+    }
+
+    std::wstring QueryServiceBinaryPath(SC_HANDLE hService) {
+        DWORD bytesNeeded = 0;
+        QueryServiceConfigW(hService, NULL, 0, &bytesNeeded);
+        if (bytesNeeded == 0) {
+            return L"";
+        }
+
+        std::vector<BYTE> buffer(bytesNeeded, 0);
+        QUERY_SERVICE_CONFIGW* config = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buffer.data());
+        if (!QueryServiceConfigW(hService, config, bytesNeeded, &bytesNeeded) || config->lpBinaryPathName == NULL) {
+            return L"";
+        }
+
+        return std::wstring(config->lpBinaryPathName);
+    }
+
+    std::wstring ResolveServiceBinaryPath(const std::wstring& serviceBinaryPath) {
+        if (serviceBinaryPath.empty()) {
+            return L"";
+        }
+
+        std::wstring normalized = serviceBinaryPath;
+        if (normalized.size() >= 2 && normalized.front() == L'"' && normalized.back() == L'"') {
+            normalized = normalized.substr(1, normalized.size() - 2);
+        }
+
+        if (normalized.find(L':') != std::wstring::npos ||
+            normalized.rfind(L"\\\\", 0) == 0) {
+            return normalized;
+        }
+
+        wchar_t windowsDirectory[MAX_PATH] = {};
+        UINT length = GetWindowsDirectoryW(windowsDirectory, RTL_NUMBER_OF(windowsDirectory));
+        if (length == 0 || length >= RTL_NUMBER_OF(windowsDirectory)) {
+            return normalized;
+        }
+
+        const std::wstring windowsRoot = windowsDirectory;
+        if (_wcsnicmp(normalized.c_str(), L"system32\\", 9) == 0) {
+            return windowsRoot + L"\\" + normalized;
+        }
+
+        if (_wcsnicmp(normalized.c_str(), L"\\SystemRoot\\", 12) == 0) {
+            return windowsRoot + normalized.substr(11);
+        }
+
+        return normalized;
+    }
+
+    void LogServiceBinaryPathState(const std::wstring& serviceName, SC_HANDLE hService) {
+        const std::wstring serviceBinaryPath = QueryServiceBinaryPath(hService);
+        if (serviceBinaryPath.empty()) {
+            return;
+        }
+
+        std::wcout << L"[*] 服务配置路径(" << serviceName << L"): " << serviceBinaryPath << std::endl;
+
+        const std::wstring resolvedPath = ResolveServiceBinaryPath(serviceBinaryPath);
+        if (resolvedPath.empty()) {
+            return;
+        }
+
+        const DWORD attributes = GetFileAttributesW(resolvedPath.c_str());
+        const bool fileExists =
+            (attributes != INVALID_FILE_ATTRIBUTES) && ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0);
+
+        std::wcout << L"[*] 解析后的文件路径(" << serviceName << L"): " << resolvedPath
+                   << L" [" << (fileExists ? L"exists" : L"missing") << L"]"
+                   << std::endl;
     }
 
     bool StopServiceIfRunning(SC_HANDLE hService) {
@@ -151,6 +229,73 @@ namespace {
             return false;
         }
 
+        return true;
+    }
+
+    std::wstring GetDirectoryPath(const std::wstring& path) {
+        const size_t separator = path.find_last_of(L"\\/");
+        if (separator == std::wstring::npos) {
+            return L"";
+        }
+
+        return path.substr(0, separator + 1);
+    }
+
+    std::wstring GetCurrentModuleDirectory() {
+        wchar_t modulePath[MAX_PATH] = {};
+        if (GetModuleFileNameW(NULL, modulePath, RTL_NUMBER_OF(modulePath)) == 0) {
+            return L"";
+        }
+
+        return GetDirectoryPath(modulePath);
+    }
+
+    std::wstring QuoteCommandArgument(const std::wstring& value) {
+        if (value.find_first_of(L" \t\"") == std::wstring::npos) {
+            return value;
+        }
+
+        std::wstring quoted = L"\"";
+        quoted += value;
+        quoted += L"\"";
+        return quoted;
+    }
+
+    std::wstring FindDriverInfPathInDirectory(const std::wstring& directoryPath) {
+        if (directoryPath.empty()) {
+            return L"";
+        }
+
+        for (const wchar_t* candidateName : kDriverInfCandidateNames) {
+            const std::wstring candidatePath = directoryPath + candidateName;
+            if (IsFileExists(candidatePath)) {
+                return candidatePath;
+            }
+        }
+
+        return L"";
+    }
+
+    std::wstring FindSiblingDriverInfPath(const std::wstring& driverPath) {
+        if (driverPath.empty()) {
+            return L"";
+        }
+
+        return FindDriverInfPathInDirectory(GetDirectoryPath(driverPath));
+    }
+
+    bool InvokeInfSection(
+        const std::wstring& infPath,
+        const std::wstring& sectionName) {
+        if (!IsFileExists(infPath)) {
+            return false;
+        }
+
+        std::wstring commandLine = sectionName;
+        commandLine += L" 132 ";
+        commandLine += QuoteCommandArgument(infPath);
+
+        InstallHinfSectionW(NULL, NULL, commandLine.c_str(), 0);
         return true;
     }
 }
@@ -295,18 +440,24 @@ bool StartWin32Service(const std::wstring& serviceName) {
         return false;
     }
 
-    SC_HANDLE hService = OpenServiceW(hSCManager, serviceName.c_str(), SERVICE_START | SERVICE_QUERY_STATUS);
+    SC_HANDLE hService = OpenServiceW(
+        hSCManager,
+        serviceName.c_str(),
+        SERVICE_START | SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG);
     if (!hService) {
         std::wcerr << L"[-] 错误：打开服务失败 (错误码: " << GetLastError() << L")" << std::endl;
         CloseServiceHandle(hSCManager);
         return false;
     }
 
+    LogServiceBinaryPathState(serviceName, hService);
+
     bool success = true;
     if (!StartServiceW(hService, 0, NULL)) {
         DWORD err = GetLastError();
         if (err != ERROR_SERVICE_ALREADY_RUNNING) {
             std::wcerr << L"[-] 错误：启动服务失败 (错误码: " << err << L")" << std::endl;
+            LogServiceBinaryPathState(serviceName, hService);
             success = false;
         }
     }
@@ -396,6 +547,51 @@ bool QueryKernelDriverServiceState(
     return QueryWin32ServiceState(serviceName, outState, outExists);
 }
 
+static bool InstallKernelDriverViaInf(
+    const std::wstring& infPath,
+    const std::wstring& serviceName) {
+    DWORD serviceState = SERVICE_STOPPED;
+    bool serviceExists = false;
+    if (QueryKernelDriverServiceState(serviceName, serviceState, serviceExists) && serviceExists) {
+        if (!StopWin32Service(serviceName)) {
+            return false;
+        }
+    }
+
+    if (!InvokeInfSection(infPath, L"DefaultInstall")) {
+        return false;
+    }
+
+    DWORD installedState = SERVICE_STOPPED;
+    bool installedExists = false;
+    if (!QueryKernelDriverServiceState(serviceName, installedState, installedExists) || !installedExists) {
+        std::wcerr << L"[-] 错误：执行 INF 安装后未发现驱动服务。INF: " << infPath << std::endl;
+        return false;
+    }
+
+    return true;
+}
+
+static bool UninstallKernelDriverViaInf(
+    const std::wstring& infPath,
+    const std::wstring& serviceName) {
+    if (!StopWin32Service(serviceName)) {
+        return false;
+    }
+
+    if (!InvokeInfSection(infPath, L"DefaultUninstall")) {
+        return false;
+    }
+
+    DWORD serviceState = SERVICE_STOPPED;
+    bool serviceExists = false;
+    if (!QueryKernelDriverServiceState(serviceName, serviceState, serviceExists)) {
+        return false;
+    }
+
+    return !serviceExists;
+}
+
 bool LoadKernelDriver(const std::wstring& driverPath, const std::wstring& serviceName) {
     if (!IsRunAsAdmin()) {
         std::wcerr << L"[-] 错误：加载驱动需要管理员权限！" << std::endl;
@@ -405,6 +601,20 @@ bool LoadKernelDriver(const std::wstring& driverPath, const std::wstring& servic
     if (!IsFileExists(driverPath)) {
         std::wcerr << L"[-] 错误：驱动文件不存在，无法注册服务！路径: " << driverPath << std::endl;
         return false;
+    }
+
+    const std::wstring infPath = FindSiblingDriverInfPath(driverPath);
+    if (!infPath.empty()) {
+        if (InstallKernelDriverViaInf(infPath, serviceName)) {
+            if (!StartWin32Service(serviceName)) {
+                std::wcerr << L"[-] 错误：INF 安装完成，但驱动服务启动失败。" << std::endl;
+                return false;
+            }
+
+            return true;
+        }
+
+        std::wcerr << L"[!] 警告：标准 INF 安装失败，回退到旧版服务注册路径。INF: " << infPath << std::endl;
     }
 
     SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);
@@ -489,6 +699,15 @@ bool UnloadKernelDriver(const std::wstring& serviceName) {
     if (!IsRunAsAdmin()) {
         std::wcerr << L"[-] 错误：卸载驱动需要管理员权限！" << std::endl;
         return false;
+    }
+
+    const std::wstring infPath = FindDriverInfPathInDirectory(GetCurrentModuleDirectory());
+    if (!infPath.empty()) {
+        if (UninstallKernelDriverViaInf(infPath, serviceName)) {
+            return true;
+        }
+
+        std::wcerr << L"[!] 警告：标准 INF 卸载失败，回退到旧版服务删除路径。INF: " << infPath << std::endl;
     }
 
     SC_HANDLE hSCManager = OpenSCManager(NULL, NULL, SC_MANAGER_ALL_ACCESS);

@@ -30,6 +30,7 @@ namespace {
     HANDLE g_ShutdownCompleteEvent = NULL;
     std::atomic<void*> g_MainDeviceHandle{ INVALID_HANDLE_VALUE };
     std::atomic<void*> g_DriverEventDeviceHandle{ INVALID_HANDLE_VALUE };
+    std::atomic<void*> g_HeartbeatDeviceHandle{ INVALID_HANDLE_VALUE };
     std::atomic<void*> g_ProcessPortHandle{ INVALID_HANDLE_VALUE };
     SERVICE_STATUS_HANDLE g_ServiceStatusHandle = NULL;
     SERVICE_STATUS g_ServiceStatus = {};
@@ -52,6 +53,8 @@ namespace {
     struct ProcessCacheEntry {
         std::wstring processName;
         std::wstring commandLine;
+        std::wstring imagePath;
+        ULONGLONG createTime = 0;
         ULONGLONG lastSeenTick = 0;
     };
 
@@ -123,10 +126,18 @@ namespace {
             CancelIoEx(driverEventHandle, NULL);
         }
 
+        HANDLE heartbeatHandle = reinterpret_cast<HANDLE>(g_HeartbeatDeviceHandle.load(std::memory_order_acquire));
+        if (IsTrackedHandleValid(heartbeatHandle) &&
+            heartbeatHandle != mainDeviceHandle &&
+            heartbeatHandle != driverEventHandle) {
+            CancelIoEx(heartbeatHandle, NULL);
+        }
+
         HANDLE processPortHandle = reinterpret_cast<HANDLE>(g_ProcessPortHandle.load(std::memory_order_acquire));
         if (IsTrackedHandleValid(processPortHandle) &&
             processPortHandle != mainDeviceHandle &&
-            processPortHandle != driverEventHandle) {
+            processPortHandle != driverEventHandle &&
+            processPortHandle != heartbeatHandle) {
             CancelIoEx(processPortHandle, NULL);
         }
 
@@ -275,6 +286,10 @@ namespace {
         return (failMode == PROCESS_VERDICT_FAIL_CLOSE) ? L"fail_close" : L"fail_open";
     }
 
+    std::wstring ProtectionModeToString(ULONG protectionMode) {
+        return (protectionMode == HIPS_MODE_MONITOR_ONLY) ? L"monitor_only" : L"blocking";
+    }
+
     std::wstring ResponseActionToString(ULONG responseAction) {
         switch (responseAction) {
         case RESPONSE_ACTION_TERMINATE_PROCESS:
@@ -284,10 +299,14 @@ namespace {
         }
     }
 
-        std::wstring DriverEventTypeToString(ULONG eventType) {
+    std::wstring DriverEventTypeToString(ULONG eventType) {
         switch (eventType) {
         case DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION:
             return L"blocked_registry_operation";
+        case DRIVER_EVENT_TYPE_OBSERVED_REGISTRY_OPERATION:
+            return L"observed_registry_operation";
+        case DRIVER_EVENT_TYPE_OBSERVED_PROCESS_CREATE:
+            return L"observed_process_create";
         case DRIVER_EVENT_TYPE_RESPONSE_ACTION:
             return L"response_action";
         default:
@@ -413,12 +432,19 @@ namespace {
         if (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) {
             flagsText += L"process_port ";
         }
+        if (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_BREAKER_OPEN) {
+            flagsText += L"process_breaker ";
+        }
+        if (status.StatusFlags & DRIVER_STATUS_FLAG_MONITOR_ONLY) {
+            flagsText += L"monitor_only ";
+        }
         if (flagsText.empty()) {
             flagsText = L"<none>";
         }
 
         LogMessage(
             L"[+] 驱动状态: Flags=" + flagsText +
+            L", protection_mode=" + ProtectionModeToString(status.ProtectionMode) +
             L", 注册表拦截规则=" + std::to_wstring(status.RegistryRuleCount) +
             L", 注册表白名单规则=" + std::to_wstring(status.RegistryAllowRuleCount) +
             L", 驱动事件队列=" + std::to_wstring(status.DriverEventQueueCount) +
@@ -428,6 +454,8 @@ namespace {
         LogMessage(
             L"[+] 进程裁决链路: connected=" +
             std::wstring((status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) ? L"yes" : L"no") +
+            L", breaker_open=" +
+            std::wstring((status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_BREAKER_OPEN) ? L"yes" : L"no") +
             L", 请求=" + std::to_wstring(status.ProcessVerdictRequestCount) +
             L", 超时=" + std::to_wstring(status.ProcessVerdictTimeoutCount) +
             L", 端口连接=" + std::to_wstring(status.ProcessPortConnectCount) +
@@ -436,13 +464,21 @@ namespace {
         LogMessage(
             L"[+] 进程裁决策略: timeout=" + std::to_wstring(status.ProcessVerdictTimeoutMs) +
             L"ms, fail_mode=" + ProcessVerdictFailModeToString(status.ProcessVerdictFailMode) +
+            L", heartbeat_interval=" + std::to_wstring(status.HeartbeatIntervalMs) +
+            L"ms, heartbeat_timeout=" + std::to_wstring(status.HeartbeatTimeoutMs) + L"ms" +
             L", capture_parent_cmdline=" +
             std::wstring((status.CaptureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED) ? L"enabled" : L"disabled"));
 
         LogMessage(
             L"[+] 进程裁决时间点: 最近连接=" + FormatDriverSystemTimeValue(status.LastProcessPortConnectTime) +
             L", 最近断开=" + FormatDriverSystemTimeValue(status.LastProcessPortDisconnectTime) +
-            L", 最近超时=" + FormatDriverSystemTimeValue(status.LastProcessVerdictTimeoutTime));
+            L", 最近超时=" + FormatDriverSystemTimeValue(status.LastProcessVerdictTimeoutTime) +
+            L", 最近心跳=" + FormatDriverSystemTimeValue(status.LastHeartbeatTime));
+
+        LogMessage(
+            L"[+] 进程断路器状态: 打开次数=" + std::to_wstring(status.ProcessBreakerOpenCount) +
+            L", 最近打开=" + FormatDriverSystemTimeValue(status.LastProcessBreakerOpenTime) +
+            L", 最近关闭=" + FormatDriverSystemTimeValue(status.LastProcessBreakerCloseTime));
 
         if (status.ConfigVersion[0] != L'\0' || status.ProfileName[0] != L'\0') {
             LogMessage(
@@ -528,11 +564,16 @@ namespace {
         }
     }
 
-    void CacheProcessContext(DWORD pid, const std::wstring& processName, const std::wstring& commandLine) {
-        if (pid == 0 || (processName.empty() && commandLine.empty())) {
+    void CacheProcessContext(
+        DWORD pid,
+        const std::wstring& processName,
+        const std::wstring& commandLine,
+        const std::wstring& imagePath = L"") {
+        if (pid == 0 || (processName.empty() && commandLine.empty() && imagePath.empty())) {
             return;
         }
 
+        const ULONGLONG nowTick = GetTickCount64();
         std::lock_guard<std::mutex> lock(g_ProcessCacheLock);
         ProcessCacheEntry& entry = g_ProcessCache[pid];
         if (!processName.empty() && processName != L"<unknown>") {
@@ -541,7 +582,13 @@ namespace {
         if (!commandLine.empty()) {
             entry.commandLine = commandLine;
         }
-        entry.lastSeenTick = GetTickCount64();
+        if (!imagePath.empty()) {
+            entry.imagePath = imagePath;
+        }
+        if (entry.createTime == 0) {
+            entry.createTime = nowTick;
+        }
+        entry.lastSeenTick = nowTick;
         PruneProcessCacheLocked(entry.lastSeenTick);
     }
 
@@ -1297,8 +1344,8 @@ static bool HandleProcessVerdictMessage(
         parentName = L"<unknown>";
     }
 
-    CacheProcessContext(message.request.ProcessId, childName, cmdLine);
-    CacheProcessContext(message.request.ParentProcessId, parentName, parentCmdLine);
+    CacheProcessContext(message.request.ProcessId, childName, cmdLine, childImagePath);
+    CacheProcessContext(message.request.ParentProcessId, parentName, parentCmdLine, parentImagePath);
 
     if (parentCmdLine.empty()) {
         parentCmdLine = GetCachedProcessCommandLine(message.request.ParentProcessId);
@@ -1451,6 +1498,58 @@ static bool HandleProcessVerdictMessage(
     }
 
     return true;
+}
+
+void HeartbeatMonitorThread() {
+    bool wasConnected = false;
+
+    while (!IsShutdownRequested()) {
+        HANDLE hHeartbeatDevice = OpenDriverDevice();
+        if (hHeartbeatDevice == INVALID_HANDLE_VALUE) {
+            if (wasConnected) {
+                LogMessage(L"[!] 进程裁决心跳通道断开，等待驱动设备恢复。");
+                wasConnected = false;
+            }
+
+            if (WaitForShutdown(PROCESS_HEARTBEAT_INTERVAL_MS_DEFAULT)) {
+                break;
+            }
+            continue;
+        }
+
+        TrackDeviceHandle(g_HeartbeatDeviceHandle, hHeartbeatDevice);
+        if (!wasConnected) {
+            LogMessage(L"[+] 进程裁决心跳线程已启动。");
+            wasConnected = true;
+        }
+
+        while (!IsShutdownRequested()) {
+            DWORD bytesReturned = 0;
+            BOOL result = DeviceIoControl(
+                hHeartbeatDevice,
+                IOCTL_HIPS_HEARTBEAT,
+                NULL,
+                0,
+                NULL,
+                0,
+                &bytesReturned,
+                NULL);
+            if (!result) {
+                if (!IsShutdownRequested()) {
+                    LogMessage(
+                        L"[!] 进程裁决心跳发送失败，错误码: " +
+                        std::to_wstring(GetLastError()));
+                }
+                break;
+            }
+
+            if (WaitForShutdown(PROCESS_HEARTBEAT_INTERVAL_MS_DEFAULT)) {
+                break;
+            }
+        }
+
+        CloseTrackedHandle(hHeartbeatDevice, g_HeartbeatDeviceHandle);
+    }
 }
 
 void ProcessVerdictMonitorThread() {
@@ -1692,16 +1791,27 @@ static bool PostDriverEventReceive(HANDLE hDriverDevice, DriverEventAsyncContext
 static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     std::wstring targetPath(driverEvent.TargetPath);
     std::wstring processName(driverEvent.ProcessName);
+    std::wstring commandLine(driverEvent.CommandLine);
     std::wstring ruleId(driverEvent.RuleId);
     std::wstring infoClass(driverEvent.InfoClass);
     std::wstring valueName(driverEvent.ValueName);
     std::wstring valueData(driverEvent.ValueData);
     std::wstring threatDesc;
     int severity = static_cast<int>(driverEvent.Severity);
+    DWORD parentProcessId = driverEvent.ParentProcessId;
     std::wstring registryOperation = RegistryOperationToString(driverEvent.RegistryOperation);
     std::wstring responseAction = ResponseActionToString(driverEvent.ResponseAction);
     std::wstring responseStatusText = FormatNtStatusHex(driverEvent.ResponseStatus);
     bool responseSucceeded = driverEvent.ResponseStatus >= 0;
+    const bool isObservedProcessCreate = (driverEvent.EventType == DRIVER_EVENT_TYPE_OBSERVED_PROCESS_CREATE);
+    const std::wstring driverEventTypeName = DriverEventTypeToString(driverEvent.EventType);
+
+    if (isObservedProcessCreate && processName.empty() && !targetPath.empty()) {
+        processName = ExtractProcessNameFromImagePath(targetPath);
+    }
+    if (isObservedProcessCreate) {
+        CacheProcessContext(driverEvent.ProcessId, processName, commandLine, targetPath);
+    }
 
     if (!ruleId.empty()) {
         int configuredSeverity = 0;
@@ -1743,6 +1853,51 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
             }
         }
     }
+    else if (driverEvent.EventType == DRIVER_EVENT_TYPE_OBSERVED_REGISTRY_OPERATION) {
+        LogMessage(L"[*] 在监控模式下观测到命中规则的注册表操作，未执行阻断。");
+        LogMessage(L"    └─ 操作类型: " + registryOperation);
+        if (!ruleId.empty()) {
+            LogMessage(L"    └─ 规则 ID: " + ruleId);
+        }
+        if (!threatDesc.empty()) {
+            LogMessage(L"    └─ 威胁描述: " + threatDesc);
+        }
+        if (severity > 0) {
+            LogMessage(L"    └─ Severity: " + std::to_wstring(severity));
+        }
+        if (!processName.empty()) {
+            LogMessage(L"    └─ 发起进程: " + processName + L" (PID: " + std::to_wstring(driverEvent.ProcessId) + L")");
+        }
+        LogMessage(L"    └─ 注册表路径: " + targetPath);
+        if (!infoClass.empty()) {
+            LogMessage(L"    └─ InfoClass: " + infoClass);
+        }
+        if (!valueName.empty()) {
+            LogMessage(L"    └─ 值名称: " + valueName);
+        }
+        if (!valueData.empty()) {
+            if (driverEvent.RegistryOperation == REGISTRY_OPERATION_RENAME_KEY) {
+                LogMessage(L"    └─ 新名称: " + valueData);
+            }
+            else {
+                LogMessage(L"    └─ 值数据: " + valueData);
+            }
+        }
+    }
+    else if (isObservedProcessCreate) {
+        LogMessage(L"[*] 在监控模式下观测到进程创建，未进入同步裁决链路。");
+        LogMessage(L"    └─ 进程 PID: " + std::to_wstring(driverEvent.ProcessId));
+        LogMessage(L"    └─ 父进程 PID: " + std::to_wstring(parentProcessId));
+        if (!processName.empty()) {
+            LogMessage(L"    └─ 进程名: " + processName);
+        }
+        if (!targetPath.empty()) {
+            LogMessage(L"    └─ 镜像路径: " + targetPath);
+        }
+        if (!commandLine.empty()) {
+            LogMessage(L"    └─ 命令行: " + commandLine);
+        }
+    }
     else if (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION) {
         LogMessage(responseSucceeded
             ? L"[+] 驱动响应动作执行成功。"
@@ -1759,15 +1914,26 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     }
 
     json driverEventJson = BuildBaseJsonEvent(
-        "driver_event",
-        (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION && responseSucceeded) ? "info" : "warn");
+        isObservedProcessCreate ? "observed_process_operation" : "driver_event",
+        (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION && responseSucceeded) ? "info" :
+        (isObservedProcessCreate ? "info" : "warn"));
     driverEventJson["driver_event_type"] = driverEvent.EventType;
+    driverEventJson["driver_event_name"] = WStringToUtf8(driverEventTypeName);
     driverEventJson["process_id"] = driverEvent.ProcessId;
     driverEventJson["severity"] = severity;
     if (driverEvent.EventType == DRIVER_EVENT_TYPE_RESPONSE_ACTION) {
         driverEventJson["response_action"] = WStringToUtf8(responseAction);
         driverEventJson["response_status"] = WStringToUtf8(responseStatusText);
         driverEventJson["response_success"] = responseSucceeded;
+    }
+    else if (isObservedProcessCreate) {
+        driverEventJson["parent_process_id"] = parentProcessId;
+        if (!targetPath.empty()) {
+            driverEventJson["image_path"] = WStringToUtf8(targetPath);
+        }
+        if (!commandLine.empty()) {
+            driverEventJson["command_line"] = WStringToUtf8(commandLine);
+        }
     }
     else {
         driverEventJson["registry_operation"] = WStringToUtf8(registryOperation);
@@ -1781,7 +1947,7 @@ static void HandleDriverEventPayload(const DRIVER_EVENT& driverEvent) {
     if (!threatDesc.empty()) {
         driverEventJson["threat_desc"] = WStringToUtf8(threatDesc);
     }
-    if (!targetPath.empty()) {
+    if (!targetPath.empty() && !isObservedProcessCreate) {
         driverEventJson["target_path"] = WStringToUtf8(targetPath);
     }
     if (!infoClass.empty()) {
@@ -1950,6 +2116,7 @@ static int RunProtectionEngine(bool serviceMode) {
     }
 
     HANDLE hDevice = INVALID_HANDLE_VALUE;
+    std::thread heartbeatThread;
     std::thread processThread;
     std::thread driverThread;
     std::thread ruleReloadThread;
@@ -1992,6 +2159,7 @@ static int RunProtectionEngine(bool serviceMode) {
         LogMessage(L"[!] 警告：初始内核规则同步未完全成功，程序将继续运行并在后续重连时重试。");
     }
 
+    heartbeatThread = std::thread(HeartbeatMonitorThread);
     processThread = std::thread(ProcessVerdictMonitorThread);
     driverThread = std::thread(DriverEventMonitorThread);
     ruleReloadThread = std::thread(RulesHotReloadThread, rulesPath);
@@ -2005,6 +2173,9 @@ Cleanup:
     RequestShutdown();
     CloseTrackedHandle(hDevice, g_MainDeviceHandle);
 
+    if (heartbeatThread.joinable()) {
+        heartbeatThread.join();
+    }
     if (processThread.joinable()) {
         processThread.join();
     }

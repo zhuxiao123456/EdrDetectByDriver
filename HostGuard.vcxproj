@@ -163,6 +163,8 @@
     <ClInclude Include="DriverUtils.h" />
     <ClInclude Include="RuleManager.h" />
     <ClInclude Include="Shared.h" />
+    <ClInclude Include="..\Common\PebMonitorShared.h" />
+    <ClInclude Include="resource.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="packages.config" />
