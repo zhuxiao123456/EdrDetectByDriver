@@ -16,7 +16,7 @@ typedef struct _PEB_LITE {
     PRTL_USER_PROCESS_PARAMETERS_LITE ProcessParameters;
 } PEB_LITE, *PPEB_LITE;
 
-EXTERN_C PVOID PsGetProcessPeb(_In_ PEPROCESS Process);
+EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
 static VOID CopyUnicodeStringToFixedBuffer(
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -118,35 +118,111 @@ static BOOLEAN CaptureUnicodeStringToLocalBuffer(
     return capturedValue->Length > 0;
 }
 
-static VOID QueueKernelEvent(
-    _In_ ULONG eventType,
-    _In_ ULONG registryOperation,
-    _In_ ULONG fileOperation,
-    _In_ ULONG processId,
-    _In_opt_z_ PCWSTR processName,
-    _In_opt_z_ PCWSTR ruleId,
-    _In_ ULONG severity,
-    _In_opt_ PCUNICODE_STRING targetPath,
-    _In_opt_z_ PCWSTR infoClass,
-    _In_opt_ PCUNICODE_STRING valueName,
-    _In_opt_z_ PCWSTR valueData) {
-    UNREFERENCED_PARAMETER(fileOperation);
+static BOOLEAN CaptureUnicodeStringToLocalBufferWithEllipsis(
+    _In_opt_ PCUNICODE_STRING source,
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _Out_ PUNICODE_STRING capturedValue) {
+    ULONG sourceLength = 0;
 
-    PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
-    if (!node) {
-        InterlockedIncrement64(&g_DriverEventAllocFailCount);
+    __try {
+        if (source != NULL) {
+            sourceLength = source->Length;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        sourceLength = 0;
+    }
+
+    BOOLEAN captured = CaptureUnicodeStringToLocalBuffer(source, buffer, bufferLength, capturedValue);
+    ULONG maxBytes = (ULONG)((bufferLength - 1) * sizeof(WCHAR));
+    if (captured && sourceLength > maxBytes && bufferLength > 4) {
+        buffer[bufferLength - 4] = L'.';
+        buffer[bufferLength - 3] = L'.';
+        buffer[bufferLength - 2] = L'.';
+        buffer[bufferLength - 1] = L'\0';
+    }
+
+    return captured;
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static BOOLEAN CaptureUnicodeStringToLocalText(
+    _In_opt_ PCUNICODE_STRING source,
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength) {
+    UNICODE_STRING capturedValue = {};
+    return CaptureUnicodeStringToLocalBuffer(source, buffer, bufferLength, &capturedValue);
+}
+
+static VOID CaptureProcessShortName(
+    _In_opt_ PEPROCESS process,
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength) {
+    if (buffer == NULL || bufferLength == 0) {
         return;
     }
-    node->EventData.EventType = eventType;
-    node->EventData.RegistryOperation = registryOperation;
-    node->EventData.ProcessId = processId;
-    node->EventData.Severity = severity;
-    CopyWideStringToFixedBuffer(node->EventData.ProcessName, RTL_NUMBER_OF(node->EventData.ProcessName), processName);
-    CopyWideStringToFixedBuffer(node->EventData.RuleId, RTL_NUMBER_OF(node->EventData.RuleId), ruleId);
-    CopyUnicodeStringToFixedBuffer(node->EventData.TargetPath, RTL_NUMBER_OF(node->EventData.TargetPath), targetPath);
-    CopyWideStringToFixedBuffer(node->EventData.InfoClass, RTL_NUMBER_OF(node->EventData.InfoClass), infoClass);
-    CopyUnicodeStringToFixedBuffer(node->EventData.ValueName, RTL_NUMBER_OF(node->EventData.ValueName), valueName);
-    CopyWideStringToFixedBuffer(node->EventData.ValueData, RTL_NUMBER_OF(node->EventData.ValueData), valueData);
+
+    buffer[0] = L'\0';
+    if (process == NULL) {
+        return;
+    }
+
+    PCHAR imageName = PsGetProcessImageFileName(process);
+    if (imageName == NULL || imageName[0] == '\0') {
+        return;
+    }
+
+    SIZE_T index = 0;
+    while (index + 1 < bufferLength && imageName[index] != '\0') {
+        CHAR character = imageName[index];
+        if (character >= 'A' && character <= 'Z') {
+            character = (CHAR)(character - 'A' + 'a');
+        }
+        buffer[index] = (WCHAR)(UCHAR)character;
+        index++;
+    }
+
+    buffer[index] = L'\0';
+}
+
+static VOID ExtractProcessNameFromPathBuffer(
+    _In_opt_z_ PCWSTR path,
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    if (path == NULL || path[0] == L'\0') {
+        return;
+    }
+
+    SIZE_T startIndex = 0;
+    for (SIZE_T index = 0; path[index] != L'\0'; ++index) {
+        if (path[index] == L'\\' || path[index] == L'/') {
+            startIndex = index + 1;
+        }
+    }
+
+    SIZE_T writeIndex = 0;
+    while (writeIndex + 1 < bufferLength && path[startIndex + writeIndex] != L'\0') {
+        WCHAR character = path[startIndex + writeIndex];
+        if (character >= L'A' && character <= L'Z') {
+            character = (WCHAR)(character - L'A' + L'a');
+        }
+        buffer[writeIndex] = character;
+        writeIndex++;
+    }
+
+    buffer[writeIndex] = L'\0';
+}
+
+static VOID EnqueueDriverEventNode(_Inout_opt_ PDRIVER_EVENT_NODE node) {
+    if (node == NULL) {
+        return;
+    }
 
     KIRQL oldIrql;
     PIRP irpToComplete = NULL;
@@ -182,6 +258,59 @@ static VOID QueueKernelEvent(
         IoCompleteRequest(irpToComplete, IO_NO_INCREMENT);
         FreeDriverEventNode(node);
     }
+}
+
+static VOID QueueKernelEvent(
+    _In_ ULONG eventType,
+    _In_ ULONG registryOperation,
+    _In_ ULONG fileOperation,
+    _In_ ULONG processId,
+    _In_opt_z_ PCWSTR processName,
+    _In_opt_z_ PCWSTR ruleId,
+    _In_ ULONG severity,
+    _In_opt_ PCUNICODE_STRING targetPath,
+    _In_opt_z_ PCWSTR infoClass,
+    _In_opt_ PCUNICODE_STRING valueName,
+    _In_opt_z_ PCWSTR valueData) {
+    UNREFERENCED_PARAMETER(fileOperation);
+
+    PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
+    if (!node) {
+        InterlockedIncrement64(&g_DriverEventAllocFailCount);
+        return;
+    }
+    node->EventData.EventType = eventType;
+    node->EventData.RegistryOperation = registryOperation;
+    node->EventData.ProcessId = processId;
+    node->EventData.Severity = severity;
+    CopyWideStringToFixedBuffer(node->EventData.ProcessName, RTL_NUMBER_OF(node->EventData.ProcessName), processName);
+    CopyWideStringToFixedBuffer(node->EventData.RuleId, RTL_NUMBER_OF(node->EventData.RuleId), ruleId);
+    CopyUnicodeStringToFixedBuffer(node->EventData.TargetPath, RTL_NUMBER_OF(node->EventData.TargetPath), targetPath);
+    CopyWideStringToFixedBuffer(node->EventData.InfoClass, RTL_NUMBER_OF(node->EventData.InfoClass), infoClass);
+    CopyUnicodeStringToFixedBuffer(node->EventData.ValueName, RTL_NUMBER_OF(node->EventData.ValueName), valueName);
+    CopyWideStringToFixedBuffer(node->EventData.ValueData, RTL_NUMBER_OF(node->EventData.ValueData), valueData);
+    EnqueueDriverEventNode(node);
+}
+
+static VOID QueueProcessObservedEvent(
+    _In_ HANDLE processId,
+    _In_opt_ HANDLE parentProcessId,
+    _In_opt_z_ PCWSTR imagePath,
+    _In_opt_z_ PCWSTR processName,
+    _In_opt_z_ PCWSTR commandLine) {
+    PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
+    if (!node) {
+        InterlockedIncrement64(&g_DriverEventAllocFailCount);
+        return;
+    }
+
+    node->EventData.EventType = DRIVER_EVENT_TYPE_OBSERVED_PROCESS_CREATE;
+    node->EventData.ProcessId = HandleToULong(processId);
+    node->EventData.ParentProcessId = HandleToULong(parentProcessId);
+    CopyWideStringToFixedBuffer(node->EventData.ProcessName, RTL_NUMBER_OF(node->EventData.ProcessName), processName);
+    CopyWideStringToFixedBuffer(node->EventData.CommandLine, RTL_NUMBER_OF(node->EventData.CommandLine), commandLine);
+    CopyWideStringToFixedBuffer(node->EventData.TargetPath, RTL_NUMBER_OF(node->EventData.TargetPath), imagePath);
+    EnqueueDriverEventNode(node);
 }
 
 const FLT_OPERATION_REGISTRATION g_FilterOperationCallbacks[] = {
@@ -394,7 +523,7 @@ static VOID GetCurrentProcessName(
     buffer[0] = L'\0';
 
     PUNICODE_STRING imagePath = NULL;
-    if (!NT_SUCCESS(SeLocateProcessImageName(PsGetCurrentProcess(), &imagePath)) ||
+    if (!NT_SUCCESS(QueryProcessImageNameCompat(PsGetCurrentProcess(), &imagePath)) ||
         imagePath == NULL ||
         imagePath->Buffer == NULL ||
         imagePath->Length == 0) {
@@ -423,6 +552,7 @@ static VOID GetCurrentProcessName(
     ExFreePool(imagePath);
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID CaptureProcessImagePath(
     _In_opt_ PEPROCESS process,
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -432,12 +562,12 @@ static VOID CaptureProcessImagePath(
     }
 
     buffer[0] = L'\0';
-    if (process == NULL) {
+    if (process == NULL || KeGetCurrentIrql() != PASSIVE_LEVEL) {
         return;
     }
 
     PUNICODE_STRING imagePath = NULL;
-    if (NT_SUCCESS(SeLocateProcessImageName(process, &imagePath)) &&
+    if (NT_SUCCESS(QueryProcessImageNameCompat(process, &imagePath)) &&
         imagePath != NULL &&
         imagePath->Buffer != NULL &&
         imagePath->Length > 0) {
@@ -449,6 +579,7 @@ static VOID CaptureProcessImagePath(
     }
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID CaptureProcessImagePathByProcessId(
     _In_opt_ HANDLE processId,
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -471,6 +602,7 @@ static VOID CaptureProcessImagePathByProcessId(
     ObDereferenceObject(process);
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID CaptureProcessCommandLine(
     _In_opt_ PEPROCESS process,
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -488,7 +620,7 @@ static VOID CaptureProcessCommandLine(
     KeStackAttachProcess(process, &apcState);
 
     __try {
-        PPEB_LITE peb = (PPEB_LITE)PsGetProcessPeb(process);
+        PPEB_LITE peb = (PPEB_LITE)QueryProcessPebCompat(process);
         if (peb != NULL && peb->ProcessParameters != NULL) {
             CopyUnicodeStringToFixedBuffer(
                 buffer,
@@ -503,6 +635,7 @@ static VOID CaptureProcessCommandLine(
     KeUnstackDetachProcess(&apcState);
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 static VOID CaptureProcessCommandLineByProcessId(
     _In_opt_ HANDLE processId,
     _Out_writes_(bufferLength) WCHAR* buffer,
@@ -549,6 +682,7 @@ static VOID FormatBinaryRegistryData(
     buffer[cursor] = L'\0';
 }
 
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN CaptureRegistryDataBytes(
     _In_reads_bytes_opt_(dataSize) const VOID* data,
     _In_ ULONG dataSize,
@@ -569,7 +703,15 @@ static BOOLEAN CaptureRegistryDataBytes(
         bytesToCopy = captureBufferSize;
     }
 
+    KPROCESSOR_MODE previousMode = ExGetPreviousMode();
+    if (previousMode != KernelMode && KeGetCurrentIrql() > APC_LEVEL) {
+        return FALSE;
+    }
+
     __try {
+        if (previousMode != KernelMode) {
+            ProbeForRead((PVOID)data, bytesToCopy, sizeof(UCHAR));
+        }
         RtlCopyMemory(captureBuffer, data, bytesToCopy);
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -580,6 +722,7 @@ static BOOLEAN CaptureRegistryDataBytes(
     return TRUE;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
 static BOOLEAN CaptureRegistryUnicodeString(
     _In_reads_bytes_opt_(dataSize) const VOID* data,
     _In_ ULONG dataSize,
@@ -706,17 +849,22 @@ static VOID ExtractRegistryValueDataString(
 
 static NTSTATUS QueryRegistryObjectPath(
     _In_opt_ PVOID object,
-    _Outptr_result_maybenull_ PCUNICODE_STRING* objectName) {
+    _Outptr_result_maybenull_ PCUNICODE_STRING* objectName,
+    _Out_opt_ PBOOLEAN releaseRequired) {
     if (objectName == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
     *objectName = NULL;
+    if (releaseRequired != NULL) {
+        *releaseRequired = FALSE;
+    }
+
     if (object == NULL) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    return CmCallbackGetKeyObjectIDEx(&g_RegCookie, object, NULL, objectName, 0);
+    return QueryRegistryObjectNameCompat(&g_RegCookie, object, objectName, releaseRequired);
 }
 
 static VOID BuildRegistryCreatePath(
@@ -724,7 +872,8 @@ static VOID BuildRegistryCreatePath(
     _Out_writes_(bufferLength) WCHAR* buffer,
     _In_ SIZE_T bufferLength,
     _Out_ NTSTATUS* rootStatus,
-    _Outptr_result_maybenull_ PCUNICODE_STRING* rootKeyPath) {
+    _Outptr_result_maybenull_ PCUNICODE_STRING* rootKeyPath,
+    _Out_opt_ PBOOLEAN rootKeyReleaseRequired) {
     if (buffer == NULL || bufferLength == 0 || rootStatus == NULL || rootKeyPath == NULL) {
         return;
     }
@@ -732,37 +881,42 @@ static VOID BuildRegistryCreatePath(
     buffer[0] = L'\0';
     *rootStatus = STATUS_UNSUCCESSFUL;
     *rootKeyPath = NULL;
+    if (rootKeyReleaseRequired != NULL) {
+        *rootKeyReleaseRequired = FALSE;
+    }
 
-    if (info == NULL || info->CompleteName == NULL || info->CompleteName->Buffer == NULL) {
+    if (info == NULL) {
         return;
     }
 
-    if (info->CompleteName->Length > 0 && info->CompleteName->Buffer[0] == L'\\') {
-        CopyUnicodeStringToFixedBuffer(buffer, bufferLength, info->CompleteName);
+    WCHAR completeNameBuffer[MAX_REG_PATH_LENGTH] = {};
+    if (!CaptureUnicodeStringToLocalText(info->CompleteName, completeNameBuffer, RTL_NUMBER_OF(completeNameBuffer))) {
+        return;
+    }
+
+    if (completeNameBuffer[0] == L'\\') {
+        CopyWideStringToFixedBuffer(buffer, bufferLength, completeNameBuffer);
         return;
     }
 
     if (info->RootObject != NULL) {
-        *rootStatus = QueryRegistryObjectPath(info->RootObject, rootKeyPath);
+        *rootStatus = QueryRegistryObjectPath(info->RootObject, rootKeyPath, rootKeyReleaseRequired);
         if (NT_SUCCESS(*rootStatus) && *rootKeyPath != NULL) {
-            WCHAR rootBuffer[MAX_REG_PATH_LENGTH];
-            WCHAR relativeBuffer[MAX_REG_PATH_LENGTH];
+            WCHAR rootBuffer[MAX_REG_PATH_LENGTH] = {};
 
-            CopyUnicodeStringToFixedBuffer(rootBuffer, RTL_NUMBER_OF(rootBuffer), *rootKeyPath);
-            CopyUnicodeStringToFixedBuffer(relativeBuffer, RTL_NUMBER_OF(relativeBuffer), info->CompleteName);
-
-            if (NT_SUCCESS(RtlStringCchCopyW(buffer, bufferLength, rootBuffer))) {
+            if (CaptureUnicodeStringToLocalText(*rootKeyPath, rootBuffer, RTL_NUMBER_OF(rootBuffer)) &&
+                NT_SUCCESS(RtlStringCchCopyW(buffer, bufferLength, rootBuffer))) {
                 SIZE_T currentLength = wcslen(buffer);
-                if (currentLength > 0 && buffer[currentLength - 1] != L'\\' && relativeBuffer[0] != L'\\') {
+                if (currentLength > 0 && buffer[currentLength - 1] != L'\\' && completeNameBuffer[0] != L'\\') {
                     RtlStringCchCatW(buffer, bufferLength, L"\\");
                 }
-                RtlStringCchCatW(buffer, bufferLength, relativeBuffer);
+                RtlStringCchCatW(buffer, bufferLength, completeNameBuffer);
                 return;
             }
         }
     }
 
-    CopyUnicodeStringToFixedBuffer(buffer, bufferLength, info->CompleteName);
+    CopyWideStringToFixedBuffer(buffer, bufferLength, completeNameBuffer);
 }
 
 static VOID FormatBinaryRegistryData(
@@ -908,8 +1062,10 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
 
     PCUNICODE_STRING keyPath = NULL;
     NTSTATUS keyStatus = STATUS_UNSUCCESSFUL;
+    BOOLEAN keyReleaseRequired = FALSE;
     PCUNICODE_STRING rootKeyPath = NULL;
     NTSTATUS rootKeyStatus = STATUS_UNSUCCESSFUL;
+    BOOLEAN rootKeyReleaseRequired = FALSE;
 
     GetCurrentProcessName(processName, RTL_NUMBER_OF(processName));
     keyPathBuffer[0] = L'\0';
@@ -927,13 +1083,13 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         }
 
         registryOperation = REGISTRY_OPERATION_SET_VALUE;
-        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath);
+        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath, &keyReleaseRequired);
         if (NT_SUCCESS(keyStatus) && keyPath != NULL) {
-            CopyUnicodeStringToFixedBuffer(keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer), keyPath);
+            CaptureUnicodeStringToLocalText(keyPath, keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer));
         }
 
         if (info->ValueName != NULL) {
-            CopyUnicodeStringToFixedBuffer(valueNameBuffer, RTL_NUMBER_OF(valueNameBuffer), info->ValueName);
+            CaptureUnicodeStringToLocalText(info->ValueName, valueNameBuffer, RTL_NUMBER_OF(valueNameBuffer));
         }
 
         ExtractRegistryValueDataString(info->Type, info->Data, info->DataSize, valueDataBuffer, RTL_NUMBER_OF(valueDataBuffer));
@@ -949,7 +1105,13 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         }
 
         registryOperation = REGISTRY_OPERATION_CREATE_KEY;
-        BuildRegistryCreatePath(info, keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer), &rootKeyStatus, &rootKeyPath);
+        BuildRegistryCreatePath(
+            info,
+            keyPathBuffer,
+            RTL_NUMBER_OF(keyPathBuffer),
+            &rootKeyStatus,
+            &rootKeyPath,
+            &rootKeyReleaseRequired);
         break;
     }
 
@@ -960,13 +1122,13 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         }
 
         registryOperation = REGISTRY_OPERATION_DELETE_VALUE;
-        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath);
+        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath, &keyReleaseRequired);
         if (NT_SUCCESS(keyStatus) && keyPath != NULL) {
-            CopyUnicodeStringToFixedBuffer(keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer), keyPath);
+            CaptureUnicodeStringToLocalText(keyPath, keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer));
         }
 
         if (info->ValueName != NULL) {
-            CopyUnicodeStringToFixedBuffer(valueNameBuffer, RTL_NUMBER_OF(valueNameBuffer), info->ValueName);
+            CaptureUnicodeStringToLocalText(info->ValueName, valueNameBuffer, RTL_NUMBER_OF(valueNameBuffer));
         }
         break;
     }
@@ -978,9 +1140,9 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         }
 
         registryOperation = REGISTRY_OPERATION_DELETE_KEY;
-        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath);
+        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath, &keyReleaseRequired);
         if (NT_SUCCESS(keyStatus) && keyPath != NULL) {
-            CopyUnicodeStringToFixedBuffer(keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer), keyPath);
+            CaptureUnicodeStringToLocalText(keyPath, keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer));
         }
         break;
     }
@@ -992,13 +1154,13 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         }
 
         registryOperation = REGISTRY_OPERATION_RENAME_KEY;
-        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath);
+        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath, &keyReleaseRequired);
         if (NT_SUCCESS(keyStatus) && keyPath != NULL) {
-            CopyUnicodeStringToFixedBuffer(keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer), keyPath);
+            CaptureUnicodeStringToLocalText(keyPath, keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer));
         }
 
         if (info->NewName != NULL) {
-            CopyUnicodeStringToFixedBuffer(valueDataBuffer, RTL_NUMBER_OF(valueDataBuffer), info->NewName);
+            CaptureUnicodeStringToLocalText(info->NewName, valueDataBuffer, RTL_NUMBER_OF(valueDataBuffer));
         }
         break;
     }
@@ -1010,9 +1172,9 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         }
 
         registryOperation = REGISTRY_OPERATION_SET_INFORMATION_KEY;
-        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath);
+        keyStatus = QueryRegistryObjectPath(info->Object, &keyPath, &keyReleaseRequired);
         if (NT_SUCCESS(keyStatus) && keyPath != NULL) {
-            CopyUnicodeStringToFixedBuffer(keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer), keyPath);
+            CaptureUnicodeStringToLocalText(keyPath, keyPathBuffer, RTL_NUMBER_OF(keyPathBuffer));
         }
 
         CopyWideStringToFixedBuffer(
@@ -1033,7 +1195,7 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
     }
 
     {
-        AcquireSharedPushLock(&g_RegistryAllowRuleLock);
+        AcquireSharedResourceLock(&g_RegistryAllowRuleLock);
 
         for (ULONG i = 0; i < g_RegistryAllowRuleCount; ++i) {
             if (MatchRegistryRule(
@@ -1053,11 +1215,11 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
             }
         }
 
-        ReleaseSharedPushLock(&g_RegistryAllowRuleLock);
+        ReleaseSharedResourceLock(&g_RegistryAllowRuleLock);
     }
 
     if (!registryAllowMatched) {
-        AcquireSharedPushLock(&g_RegistryRuleLock);
+        AcquireSharedResourceLock(&g_RegistryRuleLock);
 
         for (ULONG i = 0; i < g_RegistryRuleCount; ++i) {
             if (MatchRegistryRule(
@@ -1078,7 +1240,7 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
             }
         }
 
-        ReleaseSharedPushLock(&g_RegistryRuleLock);
+        ReleaseSharedResourceLock(&g_RegistryRuleLock);
     }
     else {
         KdPrint(("[EDR] Allowed registry operation by allow rule. Operation=%lu RuleId=%ws Key=%ws Value=%ws Data=%ws\n",
@@ -1092,20 +1254,35 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
     if (registryRuleMatched) {
         UNICODE_STRING keyPathString;
         UNICODE_STRING valueNameString;
+        BOOLEAN shouldBlock = (g_ProtectionMode == HIPS_MODE_BLOCKING);
+        ULONG driverEventType = shouldBlock
+            ? DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION
+            : DRIVER_EVENT_TYPE_OBSERVED_REGISTRY_OPERATION;
 
         RtlInitUnicodeString(&keyPathString, keyPathBuffer);
         RtlInitUnicodeString(&valueNameString, valueNameBuffer);
 
-        KdPrint(("[EDR] Blocked registry operation. Operation=%lu RuleId=%ws Key=%ws InfoClass=%ws Value=%ws Data=%ws\n",
-            registryOperation,
-            matchedRuleId,
-            keyPathBuffer,
-            infoClassBuffer,
-            valueNameBuffer,
-            valueDataBuffer));
+        if (shouldBlock) {
+            KdPrint(("[EDR] Blocked registry operation. Operation=%lu RuleId=%ws Key=%ws InfoClass=%ws Value=%ws Data=%ws\n",
+                registryOperation,
+                matchedRuleId,
+                keyPathBuffer,
+                infoClassBuffer,
+                valueNameBuffer,
+                valueDataBuffer));
+        }
+        else {
+            KdPrint(("[EDR] Observed registry operation in monitor-only mode. Operation=%lu RuleId=%ws Key=%ws InfoClass=%ws Value=%ws Data=%ws\n",
+                registryOperation,
+                matchedRuleId,
+                keyPathBuffer,
+                infoClassBuffer,
+                valueNameBuffer,
+                valueDataBuffer));
+        }
 
         QueueKernelEvent(
-            DRIVER_EVENT_TYPE_BLOCKED_REGISTRY_OPERATION,
+            driverEventType,
             registryOperation,
             0,
             HandleToULong(PsGetCurrentProcessId()),
@@ -1116,30 +1293,27 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
             infoClassBuffer,
             &valueNameString,
             valueDataBuffer);
-        status = STATUS_ACCESS_DENIED;
+        status = shouldBlock ? STATUS_ACCESS_DENIED : STATUS_SUCCESS;
     }
 
 Cleanup:
-    if (NT_SUCCESS(keyStatus) && keyPath != NULL) {
-        CmCallbackReleaseKeyObjectIDEx(keyPath);
-    }
-    if (NT_SUCCESS(rootKeyStatus) && rootKeyPath != NULL) {
-        CmCallbackReleaseKeyObjectIDEx(rootKeyPath);
-    }
+    ReleaseRegistryObjectNameCompat(keyPath, keyReleaseRequired);
+    ReleaseRegistryObjectNameCompat(rootKeyPath, rootKeyReleaseRequired);
 
     ExReleaseRundownProtection(&g_RundownRef);
     return status;
 }
 
+_IRQL_requires_max_(APC_LEVEL)
 static LARGE_INTEGER ProcessVerdictWaitTimeout(_Out_opt_ PULONG timeoutMs) {
     ULONG configuredTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
 
-    AcquireSharedPushLock(&g_RuntimeStatusLock);
+    AcquireSharedResourceLock(&g_RuntimeStatusLock);
     if (g_ProcessVerdictTimeoutMs >= PROCESS_VERDICT_TIMEOUT_MS_MIN &&
         g_ProcessVerdictTimeoutMs <= PROCESS_VERDICT_TIMEOUT_MS_MAX) {
         configuredTimeoutMs = g_ProcessVerdictTimeoutMs;
     }
-    ReleaseSharedPushLock(&g_RuntimeStatusLock);
+    ReleaseSharedResourceLock(&g_RuntimeStatusLock);
 
     if (timeoutMs != NULL) {
         *timeoutMs = configuredTimeoutMs;
@@ -1155,13 +1329,86 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         return;
     }
 
-    BOOLEAN blockProcess = FALSE;
-
     if (CreateInfo == NULL) {
         ExReleaseRundownProtection(&g_RundownRef);
         return;
     }
 
+    const HANDLE parentProcessId = CreateInfo->ParentProcessId;
+
+    if (g_ProtectionMode == HIPS_MODE_MONITOR_ONLY) {
+        WCHAR observedImagePath[MAX_REG_PATH_LENGTH] = {};
+        WCHAR observedProcessName[MAX_RULE_LENGTH] = {};
+        WCHAR observedCommandLine[MAX_EVENT_COMMAND_LINE_LENGTH] = {};
+        UNICODE_STRING capturedObservedImagePath = {};
+        UNICODE_STRING capturedObservedCommandLine = {};
+
+        if (!CaptureUnicodeStringToLocalBuffer(
+            CreateInfo->ImageFileName,
+            observedImagePath,
+            RTL_NUMBER_OF(observedImagePath),
+            &capturedObservedImagePath)) {
+            CaptureProcessImagePath(Process, observedImagePath, RTL_NUMBER_OF(observedImagePath));
+        }
+
+        if (observedImagePath[0] != L'\0') {
+            ExtractProcessNameFromPathBuffer(
+                observedImagePath,
+                observedProcessName,
+                RTL_NUMBER_OF(observedProcessName));
+        }
+        else {
+            CaptureProcessShortName(Process, observedProcessName, RTL_NUMBER_OF(observedProcessName));
+        }
+
+        CaptureUnicodeStringToLocalBufferWithEllipsis(
+            CreateInfo->CommandLine,
+            observedCommandLine,
+            RTL_NUMBER_OF(observedCommandLine),
+            &capturedObservedCommandLine);
+
+        QueueProcessObservedEvent(
+            ProcessId,
+            parentProcessId,
+            observedImagePath,
+            observedProcessName,
+            observedCommandLine);
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    if (InterlockedCompareExchange(&g_ProcessVerdictBreakerOpen, 0, 0) != 0) {
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    ULONG failMode = PROCESS_VERDICT_FAIL_OPEN;
+    AcquireSharedResourceLock(&g_RuntimeStatusLock);
+    if (g_ProcessVerdictFailMode == PROCESS_VERDICT_FAIL_CLOSE) {
+        failMode = PROCESS_VERDICT_FAIL_CLOSE;
+    }
+    ReleaseSharedResourceLock(&g_RuntimeStatusLock);
+
+    PFLT_FILTER filterHandle = NULL;
+    PFLT_PORT clientPort = NULL;
+
+    AcquireSharedResourceLock(&g_ProcessPortLock);
+    filterHandle = g_FilterHandle;
+    clientPort = g_ProcessClientPort;
+    ReleaseSharedResourceLock(&g_ProcessPortLock);
+
+    if (filterHandle == NULL || clientPort == NULL) {
+        if (failMode == PROCESS_VERDICT_FAIL_CLOSE) {
+            CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
+            KdPrint(("[EDR] Process verdict channel offline and fail-close is enabled. PID=%lu\n",
+                HandleToULong(ProcessId)));
+        }
+
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    BOOLEAN blockProcess = FALSE;
     PROCESS_PORT_REQUEST request = {};
     request.Version = PROCESS_PORT_PROTOCOL_VERSION;
     if (CreateInfo->FileOpenNameAvailable) {
@@ -1176,7 +1423,7 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     KeQuerySystemTime(&createTime);
     request.CreateTime = (ULONGLONG)createTime.QuadPart;
     request.ProcessId = HandleToULong(ProcessId);
-    request.ParentProcessId = HandleToULong(CreateInfo->ParentProcessId);
+    request.ParentProcessId = HandleToULong(parentProcessId);
 
     UNICODE_STRING capturedImagePath = {};
     if (!CaptureUnicodeStringToLocalBuffer(
@@ -1188,7 +1435,7 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     }
 
     CaptureProcessImagePathByProcessId(
-        CreateInfo->ParentProcessId,
+        parentProcessId,
         request.ParentImagePath,
         RTL_NUMBER_OF(request.ParentImagePath));
 
@@ -1202,15 +1449,15 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     }
 
     BOOLEAN captureParentCmdline = FALSE;
-    AcquireSharedPushLock(&g_RuntimeStatusLock);
+    AcquireSharedResourceLock(&g_RuntimeStatusLock);
     if (g_CaptureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED) {
         captureParentCmdline = TRUE;
     }
-    ReleaseSharedPushLock(&g_RuntimeStatusLock);
+    ReleaseSharedResourceLock(&g_RuntimeStatusLock);
 
     if (captureParentCmdline) {
         CaptureProcessCommandLineByProcessId(
-            CreateInfo->ParentProcessId,
+            parentProcessId,
             request.ParentCommandLine,
             RTL_NUMBER_OF(request.ParentCommandLine));
     }
@@ -1225,32 +1472,14 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     ULONG timeoutMs = 0;
     LARGE_INTEGER timeout = ProcessVerdictWaitTimeout(&timeoutMs);
     NTSTATUS sendStatus = STATUS_PORT_DISCONNECTED;
-    ULONG failMode = PROCESS_VERDICT_FAIL_OPEN;
-
-    AcquireSharedPushLock(&g_RuntimeStatusLock);
-    if (g_ProcessVerdictFailMode == PROCESS_VERDICT_FAIL_CLOSE) {
-        failMode = PROCESS_VERDICT_FAIL_CLOSE;
-    }
-    ReleaseSharedPushLock(&g_RuntimeStatusLock);
-
-    PFLT_FILTER filterHandle = NULL;
-    PFLT_PORT clientPort = NULL;
-
-    AcquireSharedPushLock(&g_ProcessPortLock);
-    filterHandle = g_FilterHandle;
-    clientPort = g_ProcessClientPort;
-    ReleaseSharedPushLock(&g_ProcessPortLock);
-
-    if (filterHandle != NULL && clientPort != NULL) {
-        sendStatus = FltSendMessage(
-            filterHandle,
-            &clientPort,
-            &request,
-            sizeof(request),
-            &reply,
-            &replyLength,
-            &timeout);
-    }
+    sendStatus = FltSendMessage(
+        filterHandle,
+        &clientPort,
+        &request,
+        sizeof(request),
+        &reply,
+        &replyLength,
+        &timeout);
 
     if (NT_SUCCESS(sendStatus) &&
         replyLength >= sizeof(PROCESS_PORT_REPLY) &&

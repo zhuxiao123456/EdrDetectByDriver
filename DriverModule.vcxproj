@@ -48,6 +48,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Legacy2012|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
+    <_NT_TARGET_VERSION>0xA000002</_NT_TARGET_VERSION>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
     <ConfigurationType>Driver</ConfigurationType>
@@ -95,7 +96,7 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -104,7 +105,7 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -113,26 +114,23 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
     <ClCompile>
-      <UndefinePreprocessorDefinitions>_WIN32_WINNT;WINVER;NTDDI_VERSION;%(UndefinePreprocessorDefinitions)</UndefinePreprocessorDefinitions>
-      <PreprocessorDefinitions>_WIN32_WINNT=0x0602;WINVER=0x0602;NTDDI_VERSION=0x06020000;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ControlFlowGuard>false</ControlFlowGuard>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalOptions>/INTEGRITYCHECK /VERSION:6.2 /SUBSYSTEM:NATIVE,6.02 /OSVERSION:6.2 %(AdditionalOptions)</AdditionalOptions>
+      <LinkControlFlowGuard>false</LinkControlFlowGuard>
+      <AdditionalDependencies>FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>/guard:no /INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
-    <PostBuildEvent>
-      <Command>"$(VCToolsInstallDir)bin\HostX64\x64\editbin.exe" /OSVERSION:6.2 /SUBSYSTEM:NATIVE,6.02 "$(TargetPath)"</Command>
-    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <Link>
-      <AdditionalDependencies>Wdmsec.lib;FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>FltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>/INTEGRITYCHECK %(AdditionalOptions)</AdditionalOptions>
     </Link>
   </ItemDefinitionGroup>
@@ -140,13 +138,21 @@
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
+    <Inf Include="DriverModule.inf" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="ApiCompatibility.cpp" />
     <ClCompile Include="IoctlDispatch.cpp" />
     <ClCompile Include="MonitorCallbacks.cpp" />
+    <ClCompile Include="OsVersionHelper.cpp" />
     <ClCompile Include="PebMonitor.cpp" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="ApiCompatibility.h" />
+    <ClInclude Include="OsVersionHelper.h" />
     <ClInclude Include="PebMonitor.h" />
     <ClInclude Include="Shared.h" />
+    <ClInclude Include="..\Common\PebMonitorShared.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

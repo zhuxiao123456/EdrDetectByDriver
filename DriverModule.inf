@@ -1,0 +1,65 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = ActivityMonitor
+ClassGuid = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
+Provider = %ManufacturerName%
+DriverVer = 04/14/2026,1.0.0.0
+CatalogFile = DriverModule.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 12
+PebMonitor.DriverFiles = 12
+
+[SourceDisksNames]
+1 = %DiskId%,,,
+
+[SourceDisksFiles]
+DriverModule.sys = 1,,
+
+[DefaultInstall]
+OptionDesc = %ServiceDescription%
+CopyFiles = PebMonitor.DriverFiles
+
+[DefaultInstall.Services]
+AddService = %ServiceName%,,PebMonitor.Service
+
+[DefaultInstall.NTamd64]
+CopyFiles = PebMonitor.DriverFiles
+
+[DefaultInstall.NTamd64.Services]
+AddService = %ServiceName%,,PebMonitor.Service
+
+[DefaultUninstall]
+DelFiles = PebMonitor.DriverFiles
+
+[DefaultUninstall.Services]
+DelService = %ServiceName%,0x200
+
+[PebMonitor.Service]
+DisplayName = %ServiceName%
+Description = %ServiceDescription%
+ServiceBinary = %12%\DriverModule.sys
+Dependencies = FltMgr
+ServiceType = 2
+StartType = 3
+ErrorControl = 1
+LoadOrderGroup = %LoadOrderGroup%
+AddReg = PebMonitor.Instances
+
+[PebMonitor.Instances]
+HKR,"Instances","DefaultInstance",0x00000000,%DefaultInstance%
+HKR,"Instances\%DefaultInstance%","Altitude",0x00000000,%Altitude%
+HKR,"Instances\%DefaultInstance%","Flags",0x00010001,0
+
+[PebMonitor.DriverFiles]
+DriverModule.sys
+
+[Strings]
+ManufacturerName = "HostGuard"
+ServiceName = "PebMonitor"
+ServiceDescription = "HostGuard Process and Registry Monitor"
+LoadOrderGroup = "FSFilter Activity Monitor"
+DefaultInstance = "PebMonitor Instance"
+Altitude = "370050"
+DiskId = "PebMonitor Driver Installation Disk"

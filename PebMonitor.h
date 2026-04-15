@@ -2,6 +2,7 @@
 #include <fltKernel.h>
 #include <ntstrsafe.h>
 #include <ntimage.h>
+#include "ApiCompatibility.h"
 #include "Shared.h"
 
 #ifndef PROCESS_TERMINATE
@@ -17,30 +18,38 @@ typedef struct _DRIVER_EVENT_NODE {
 
 extern NPAGED_LOOKASIDE_LIST g_DriverEventLookaside;
 
-FORCEINLINE VOID AcquireSharedPushLock(_Inout_ PEX_PUSH_LOCK lock) {
+_IRQL_requires_max_(APC_LEVEL)
+FORCEINLINE VOID AcquireSharedResourceLock(_Inout_ PERESOURCE lock) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     KeEnterCriticalRegion();
-    ExAcquirePushLockShared(lock);
+    ExAcquireResourceSharedLite(lock, TRUE);
 }
 
-FORCEINLINE VOID ReleaseSharedPushLock(_Inout_ PEX_PUSH_LOCK lock) {
-    ExReleasePushLockShared(lock);
+_IRQL_requires_max_(APC_LEVEL)
+FORCEINLINE VOID ReleaseSharedResourceLock(_Inout_ PERESOURCE lock) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
+    ExReleaseResourceLite(lock);
     KeLeaveCriticalRegion();
 }
 
-FORCEINLINE VOID AcquireExclusivePushLock(_Inout_ PEX_PUSH_LOCK lock) {
+_IRQL_requires_max_(APC_LEVEL)
+FORCEINLINE VOID AcquireExclusiveResourceLock(_Inout_ PERESOURCE lock) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     KeEnterCriticalRegion();
-    ExAcquirePushLockExclusive(lock);
+    ExAcquireResourceExclusiveLite(lock, TRUE);
 }
 
-FORCEINLINE VOID ReleaseExclusivePushLock(_Inout_ PEX_PUSH_LOCK lock) {
-    ExReleasePushLockExclusive(lock);
+_IRQL_requires_max_(APC_LEVEL)
+FORCEINLINE VOID ReleaseExclusiveResourceLock(_Inout_ PERESOURCE lock) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
+    ExReleaseResourceLite(lock);
     KeLeaveCriticalRegion();
 }
 
 extern PDEVICE_OBJECT g_DeviceObject;
 extern EX_RUNDOWN_REF g_RundownRef;
 extern volatile LONG64 g_NextProcessEventId;
-extern EX_PUSH_LOCK g_ProcessPortLock;
+extern ERESOURCE g_ProcessPortLock;
 extern PFLT_PORT g_ProcessServerPort;
 extern PFLT_PORT g_ProcessClientPort;
 
@@ -53,15 +62,16 @@ extern volatile LONG64 g_DriverEventAllocFailCount;
 
 extern REGISTRY_RULE g_RegistryRules[MAX_REGISTRY_RULE_COUNT];
 extern ULONG g_RegistryRuleCount;
-extern EX_PUSH_LOCK g_RegistryRuleLock;
+extern ERESOURCE g_RegistryRuleLock;
 
 extern REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
 extern ULONG g_RegistryAllowRuleCount;
-extern EX_PUSH_LOCK g_RegistryAllowRuleLock;
+extern ERESOURCE g_RegistryAllowRuleLock;
 
 extern LARGE_INTEGER g_RegCookie;
 extern ULONG g_RuntimeStatusFlags;
-extern EX_PUSH_LOCK g_RuntimeStatusLock;
+extern HIPS_PROTECTION_MODE g_ProtectionMode;
+extern ERESOURCE g_RuntimeStatusLock;
 extern ULONGLONG g_ProcessVerdictRequestCount;
 extern ULONGLONG g_ProcessVerdictTimeoutCount;
 extern ULONGLONG g_ProcessPortConnectCount;
@@ -69,13 +79,24 @@ extern ULONGLONG g_ProcessPortDisconnectCount;
 extern ULONGLONG g_LastProcessPortConnectTime;
 extern ULONGLONG g_LastProcessPortDisconnectTime;
 extern ULONGLONG g_LastProcessVerdictTimeoutTime;
+extern volatile LONG g_ProcessVerdictBreakerOpen;
+extern volatile LONG g_ProcessPortConnected;
+extern volatile LONG64 g_LastHeartbeatInterruptTime;
+extern volatile LONG64 g_LastHeartbeatTime;
+extern volatile LONG64 g_ProcessBreakerOpenCount;
+extern volatile LONG64 g_LastProcessBreakerOpenTime;
+extern volatile LONG64 g_LastProcessBreakerCloseTime;
 extern ULONG g_ProcessVerdictTimeoutMs;
 extern ULONG g_ProcessVerdictFailMode;
+extern ULONG g_HeartbeatIntervalMs;
+extern ULONG g_HeartbeatTimeoutMs;
 extern ULONG g_CaptureParentCommandLine;
 extern WCHAR g_ActiveConfigVersion[MAX_RULE_LENGTH];
 extern WCHAR g_ActiveProfileName[MAX_RULE_LENGTH];
 extern WCHAR g_ActiveGeneratedAt[MAX_RULE_LENGTH];
 extern PFLT_FILTER g_FilterHandle;
+extern KTIMER g_HeartbeatCheckTimer;
+extern KDPC g_HeartbeatCheckDpc;
 
 extern const FLT_OPERATION_REGISTRATION g_FilterOperationCallbacks[];
 extern const FLT_REGISTRATION g_FilterRegistration;
@@ -95,7 +116,9 @@ FORCEINLINE VOID FreeDriverEventNode(_In_opt_ PDRIVER_EVENT_NODE node) {
     }
 }
 
+_IRQL_requires_(PASSIVE_LEVEL)
 void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
+_IRQL_requires_max_(APC_LEVEL)
 NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_ PVOID Argument2);
 NTSTATUS FileFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags);
 
@@ -104,6 +127,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 VOID CancelPendingDriverIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp);
 VOID RecordProcessVerdictRequestEvent();
 VOID RecordProcessVerdictTimeoutEvent();
+VOID RecordProcessHeartbeatEvent();
 NTSTATUS ProcessPortConnectNotify(
     _In_ PFLT_PORT ClientPort,
     _In_opt_ PVOID ServerPortCookie,
