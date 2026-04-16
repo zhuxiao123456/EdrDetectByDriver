@@ -11,7 +11,7 @@
 #define MAX_EVENT_COMMAND_LINE_LENGTH 256
 #define MAX_REGISTRY_RULE_COUNT 256
 
-#define PEBMONITOR_ABI_VERSION 2UL
+#define PEBMONITOR_ABI_VERSION 3UL
 #define PEBMONITOR_ABI_IS_COMPAT(v) ((v) == PEBMONITOR_ABI_VERSION)
 
 #define PEB_MONITOR_DEVICE 0x8000
@@ -146,11 +146,17 @@ typedef struct _DRIVER_RUNTIME_STATUS {
     ULONG AbiVersion;
     ULONG StatusFlags;
     ULONG ProtectionMode;
+    ULONG PolicyEpoch;
     ULONG RegistryRuleCount;
     ULONG RegistryAllowRuleCount;
     ULONG DriverEventQueueCount;
     ULONGLONG DriverEventDropCount;
     ULONGLONG DriverEventAllocFailCount;
+    ULONGLONG FastPathHitCount;
+    ULONGLONG CacheHitCount;
+    ULONGLONG CacheMissCount;
+    ULONGLONG CacheFlushCount;
+    ULONGLONG SlowPathCount;
     ULONGLONG ProcessVerdictRequestCount;
     ULONGLONG ProcessVerdictTimeoutCount;
     ULONGLONG ProcessPortConnectCount;
@@ -178,4 +184,5 @@ static_assert(sizeof(EDR_TERMINATE_PROCESS_REQUEST) == 8, "Unexpected EDR_TERMIN
 static_assert(sizeof(DRIVER_EVENT) == 3868, "Unexpected DRIVER_EVENT size");
 static_assert(sizeof(REGISTRY_RULE) == 3360, "Unexpected REGISTRY_RULE size");
 static_assert(sizeof(DRIVER_CONFIG_INFO) == 1548, "Unexpected DRIVER_CONFIG_INFO size");
-static_assert(sizeof(DRIVER_RUNTIME_STATUS) == 1688, "Unexpected DRIVER_RUNTIME_STATUS size");
+static_assert(FIELD_OFFSET(DRIVER_RUNTIME_STATUS, AbiVersion) == 0, "AbiVersion must remain at offset 0");
+static_assert(sizeof(DRIVER_RUNTIME_STATUS) == 1736, "Unexpected DRIVER_RUNTIME_STATUS size");
