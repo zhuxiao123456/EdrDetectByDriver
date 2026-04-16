@@ -66,6 +66,22 @@ if ($decisionCacheSourceText -notmatch 'RememberAllowedProcessCreateDecision') {
     throw 'DecisionCache.cpp must implement RememberAllowedProcessCreateDecision.'
 }
 
+if ($fastPathSourceText -notmatch 'AcquireSharedResourceLock\(&g_FastPathStateLock\)') {
+    throw 'FastPath.cpp must use a shared lock for hot-path evaluation reads.'
+}
+
+if ($fastPathSourceText -notmatch 'PurgeTrustedProcessMatch') {
+    throw 'FastPath.cpp must lazily purge stale trusted entries after validation failures.'
+}
+
+if ($decisionCacheSourceText -notmatch 'AcquireSharedResourceLock\(&g_DecisionCacheLock\)') {
+    throw 'DecisionCache.cpp must use a shared lock for cache lookup reads.'
+}
+
+if ($decisionCacheSourceText -notmatch 'PurgeDecisionCacheProcessEntries') {
+    throw 'DecisionCache.cpp must lazily purge stale cache entries after lookup invalidation.'
+}
+
 if ($pebMonitorHeaderText -notmatch 'g_FastPathHitCount') {
     throw 'PebMonitor.h must expose g_FastPathHitCount.'
 }

@@ -79,6 +79,76 @@ namespace {
             RtlZeroMemory(entry, sizeof(*entry));
         }
     }
+
+    static BOOLEAN PurgeDecisionCacheProcessEntries(
+        _In_ ULONG processId,
+        _In_ ULONGLONG createTime,
+        _In_ ULONG policyEpoch,
+        _In_ ULONGLONG now) {
+        BOOLEAN removed = FALSE;
+
+        if (processId == 0 || createTime == 0 || policyEpoch == 0) {
+            return FALSE;
+        }
+
+        AcquireExclusiveResourceLock(&g_DecisionCacheLock);
+        for (ULONG index = 0; index < RTL_NUMBER_OF(g_DecisionCacheEntries); ++index) {
+            PDECISION_CACHE_ENTRY currentEntry = &g_DecisionCacheEntries[index];
+            if (!currentEntry->InUse || currentEntry->Key.ProcessId != processId) {
+                continue;
+            }
+
+            if (currentEntry->Key.PolicyEpoch == policyEpoch &&
+                currentEntry->Key.CreateTime == createTime &&
+                !IsCacheEntryExpired(currentEntry, now)) {
+                continue;
+            }
+
+            ResetDecisionCacheEntry(currentEntry);
+            removed = TRUE;
+        }
+        ReleaseExclusiveResourceLock(&g_DecisionCacheLock);
+
+        if (removed) {
+            InterlockedIncrement64(&g_DecisionCacheFlushCount);
+        }
+
+        return removed;
+    }
+
+    static BOOLEAN RefreshDecisionCacheHit(
+        _In_ const DECISION_CACHE_KEY* key,
+        _In_ ULONGLONG now) {
+        BOOLEAN refreshed = FALSE;
+
+        if (!IsDecisionCacheKeyValid(key)) {
+            return FALSE;
+        }
+
+        AcquireExclusiveResourceLock(&g_DecisionCacheLock);
+        for (ULONG index = 0; index < RTL_NUMBER_OF(g_DecisionCacheEntries); ++index) {
+            PDECISION_CACHE_ENTRY currentEntry = &g_DecisionCacheEntries[index];
+            if (!currentEntry->InUse) {
+                continue;
+            }
+
+            if (IsCacheEntryExpired(currentEntry, now)) {
+                continue;
+            }
+
+            if (!DecisionCacheKeysEqual(&currentEntry->Key, key)) {
+                continue;
+            }
+
+            currentEntry->LastHitTime = now;
+            currentEntry->HitCount++;
+            refreshed = TRUE;
+            break;
+        }
+        ReleaseExclusiveResourceLock(&g_DecisionCacheLock);
+
+        return refreshed;
+    }
 }
 
 NTSTATUS InitializeDecisionCacheState() {
@@ -127,15 +197,18 @@ BOOLEAN BuildProcessCreateDecisionCacheKey(
 
 BOOLEAN TryGetDecisionCacheAllow(_In_ const DECISION_CACHE_KEY* key) {
     BOOLEAN allow = FALSE;
+    BOOLEAN removeStaleEntries = FALSE;
     ULONGLONG now = 0;
+    ULONG currentPolicyEpoch = 0;
 
     if (!IsDecisionCacheKeyValid(key)) {
         return FALSE;
     }
 
     now = QueryCurrentSystemTimeValue();
+    currentPolicyEpoch = ReadCurrentPolicyEpoch();
 
-    AcquireExclusiveResourceLock(&g_DecisionCacheLock);
+    AcquireSharedResourceLock(&g_DecisionCacheLock);
     for (ULONG index = 0; index < RTL_NUMBER_OF(g_DecisionCacheEntries); ++index) {
         PDECISION_CACHE_ENTRY currentEntry = &g_DecisionCacheEntries[index];
         if (!currentEntry->InUse) {
@@ -143,10 +216,10 @@ BOOLEAN TryGetDecisionCacheAllow(_In_ const DECISION_CACHE_KEY* key) {
         }
 
         if (currentEntry->Key.ProcessId == key->ProcessId &&
-            (currentEntry->Key.PolicyEpoch != ReadCurrentPolicyEpoch() ||
+            (currentEntry->Key.PolicyEpoch != currentPolicyEpoch ||
                 currentEntry->Key.CreateTime != key->CreateTime ||
                 IsCacheEntryExpired(currentEntry, now))) {
-            ResetDecisionCacheEntry(currentEntry);
+            removeStaleEntries = TRUE;
             continue;
         }
 
@@ -154,12 +227,18 @@ BOOLEAN TryGetDecisionCacheAllow(_In_ const DECISION_CACHE_KEY* key) {
             continue;
         }
 
-        currentEntry->LastHitTime = now;
-        currentEntry->HitCount++;
         allow = TRUE;
         break;
     }
-    ReleaseExclusiveResourceLock(&g_DecisionCacheLock);
+    ReleaseSharedResourceLock(&g_DecisionCacheLock);
+
+    if (removeStaleEntries) {
+        PurgeDecisionCacheProcessEntries(key->ProcessId, key->CreateTime, currentPolicyEpoch, now);
+    }
+
+    if (allow && !RefreshDecisionCacheHit(key, now)) {
+        allow = FALSE;
+    }
 
     if (allow) {
         InterlockedIncrement64(&g_DecisionCacheHitCount);
