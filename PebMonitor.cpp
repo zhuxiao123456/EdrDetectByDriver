@@ -18,13 +18,10 @@ volatile LONG64 g_DriverEventDropCount = 0;
 volatile LONG64 g_DriverEventAllocFailCount = 0;
 NPAGED_LOOKASIDE_LIST g_DriverEventLookaside;
 
-REGISTRY_RULE g_RegistryRules[MAX_REGISTRY_RULE_COUNT];
-ULONG g_RegistryRuleCount = 0;
-ERESOURCE g_RegistryRuleLock = {};
-
-REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
-ULONG g_RegistryAllowRuleCount = 0;
-ERESOURCE g_RegistryAllowRuleLock = {};
+PRULE_STORE g_RegistryBlockRuleStore = NULL;
+PRULE_STORE g_RegistryAllowRuleStore = NULL;
+ERESOURCE g_RuleStoreStateLock = {};
+volatile LONG g_PolicyEpoch = 0;
 
 LARGE_INTEGER g_RegCookie = { 0 };
 ULONG g_RuntimeStatusFlags = 0;
@@ -319,6 +316,7 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED, FALSE);
 
     ExWaitForRundownProtectionRelease(&g_RundownRef);
+    CleanupRuleStoreState();
 
     PIRP irpToCancel = (PIRP)InterlockedExchangePointer((PVOID*)&g_PendingDriverIrp, NULL);
     if (irpToCancel != NULL) {
@@ -343,8 +341,7 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
     ResetRuntimeConfigInfo();
     ExDeleteResourceLite(&g_RuntimeStatusLock);
-    ExDeleteResourceLite(&g_RegistryAllowRuleLock);
-    ExDeleteResourceLite(&g_RegistryRuleLock);
+    ExDeleteResourceLite(&g_RuleStoreStateLock);
     ExDeleteResourceLite(&g_ProcessPortLock);
 
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\DosDevices\\PebMonitor");
@@ -383,8 +380,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN registryCallbackRegistered = FALSE;
     BOOLEAN processCallbackRegistered = FALSE;
     BOOLEAN processPortLockInitialized = FALSE;
-    BOOLEAN registryRuleLockInitialized = FALSE;
-    BOOLEAN registryAllowRuleLockInitialized = FALSE;
+    BOOLEAN ruleStoreStateLockInitialized = FALSE;
     BOOLEAN runtimeStatusLockInitialized = FALSE;
     PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     UNICODE_STRING processPortName = { 0 };
@@ -420,21 +416,16 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     g_ProcessClientPort = NULL;
     g_ProcessPortConnected = 0;
 
-    status = ExInitializeResourceLite(&g_RegistryRuleLock);
+    status = ExInitializeResourceLite(&g_RuleStoreStateLock);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
-    registryRuleLockInitialized = TRUE;
-    g_RegistryRuleCount = 0;
-    RtlZeroMemory(g_RegistryRules, sizeof(g_RegistryRules));
+    ruleStoreStateLockInitialized = TRUE;
 
-    status = ExInitializeResourceLite(&g_RegistryAllowRuleLock);
+    status = InitializeRuleStoreState();
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
-    registryAllowRuleLockInitialized = TRUE;
-    g_RegistryAllowRuleCount = 0;
-    RtlZeroMemory(g_RegistryAllowRules, sizeof(g_RegistryAllowRules));
 
     status = ExInitializeResourceLite(&g_RuntimeStatusLock);
     if (!NT_SUCCESS(status)) {
@@ -462,6 +453,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     g_HeartbeatTimeoutMs = PROCESS_HEARTBEAT_TIMEOUT_MS_DEFAULT;
     g_CaptureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
     g_NextProcessEventId = 0;
+    g_PolicyEpoch = 0;
     RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
     RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
     RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
@@ -603,11 +595,9 @@ Cleanup:
     if (runtimeStatusLockInitialized) {
         ExDeleteResourceLite(&g_RuntimeStatusLock);
     }
-    if (registryAllowRuleLockInitialized) {
-        ExDeleteResourceLite(&g_RegistryAllowRuleLock);
-    }
-    if (registryRuleLockInitialized) {
-        ExDeleteResourceLite(&g_RegistryRuleLock);
+    if (ruleStoreStateLockInitialized) {
+        CleanupRuleStoreState();
+        ExDeleteResourceLite(&g_RuleStoreStateLock);
     }
     if (processPortLockInitialized) {
         ExDeleteResourceLite(&g_ProcessPortLock);

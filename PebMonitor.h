@@ -3,6 +3,7 @@
 #include <ntstrsafe.h>
 #include <ntimage.h>
 #include "ApiCompatibility.h"
+#include "RuleStore.h"
 #include "Shared.h"
 
 #ifndef PROCESS_TERMINATE
@@ -60,13 +61,10 @@ extern ULONG g_DriverEventCount;
 extern volatile LONG64 g_DriverEventDropCount;
 extern volatile LONG64 g_DriverEventAllocFailCount;
 
-extern REGISTRY_RULE g_RegistryRules[MAX_REGISTRY_RULE_COUNT];
-extern ULONG g_RegistryRuleCount;
-extern ERESOURCE g_RegistryRuleLock;
-
-extern REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
-extern ULONG g_RegistryAllowRuleCount;
-extern ERESOURCE g_RegistryAllowRuleLock;
+extern PRULE_STORE g_RegistryBlockRuleStore;
+extern PRULE_STORE g_RegistryAllowRuleStore;
+extern ERESOURCE g_RuleStoreStateLock;
+extern volatile LONG g_PolicyEpoch;
 
 extern LARGE_INTEGER g_RegCookie;
 extern ULONG g_RuntimeStatusFlags;

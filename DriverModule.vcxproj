@@ -146,11 +146,13 @@
     <ClCompile Include="MonitorCallbacks.cpp" />
     <ClCompile Include="OsVersionHelper.cpp" />
     <ClCompile Include="PebMonitor.cpp" />
+    <ClCompile Include="RuleStore.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ApiCompatibility.h" />
     <ClInclude Include="OsVersionHelper.h" />
     <ClInclude Include="PebMonitor.h" />
+    <ClInclude Include="RuleStore.h" />
     <ClInclude Include="Shared.h" />
     <ClInclude Include="..\Common\PebMonitorShared.h" />
   </ItemGroup>

@@ -1033,6 +1033,97 @@ static BOOLEAN MatchRegistryRule(
     return TRUE;
 }
 
+static const REGISTRY_RULE* FindMatchingRegistryRuleInArray(
+    _In_reads_opt_(ruleCount) const REGISTRY_RULE* rules,
+    _In_ ULONG ruleCount,
+    _In_ ULONG actualOperation,
+    _In_opt_z_ PCWSTR processName,
+    _In_opt_z_ PCWSTR keyPath,
+    _In_opt_z_ PCWSTR infoClass,
+    _In_opt_z_ PCWSTR valueName,
+    _In_opt_z_ PCWSTR valueData) {
+    if (rules == NULL || ruleCount == 0) {
+        return NULL;
+    }
+
+    for (ULONG index = 0; index < ruleCount; ++index) {
+        if (MatchRegistryRule(
+            &rules[index],
+            actualOperation,
+            processName,
+            keyPath,
+            infoClass,
+            valueName,
+            valueData)) {
+            return &rules[index];
+        }
+    }
+
+    return NULL;
+}
+
+static const REGISTRY_RULE* FindMatchingRegistryRuleInStore(
+    _In_opt_ const RULE_STORE* store,
+    _In_ ULONG actualOperation,
+    _In_opt_z_ PCWSTR processName,
+    _In_opt_z_ PCWSTR keyPath,
+    _In_opt_z_ PCWSTR infoClass,
+    _In_opt_z_ PCWSTR valueName,
+    _In_opt_z_ PCWSTR valueData) {
+    if (store == NULL) {
+        return NULL;
+    }
+
+    const REGISTRY_RULE* matchedRule = FindMatchingRegistryRuleInArray(
+        store->ExactRules,
+        store->ExactRuleCount,
+        actualOperation,
+        processName,
+        keyPath,
+        infoClass,
+        valueName,
+        valueData);
+    if (matchedRule != NULL) {
+        return matchedRule;
+    }
+
+    matchedRule = FindMatchingRegistryRuleInArray(
+        store->PrefixRules,
+        store->PrefixRuleCount,
+        actualOperation,
+        processName,
+        keyPath,
+        infoClass,
+        valueName,
+        valueData);
+    if (matchedRule != NULL) {
+        return matchedRule;
+    }
+
+    matchedRule = FindMatchingRegistryRuleInArray(
+        store->SuffixRules,
+        store->SuffixRuleCount,
+        actualOperation,
+        processName,
+        keyPath,
+        infoClass,
+        valueName,
+        valueData);
+    if (matchedRule != NULL) {
+        return matchedRule;
+    }
+
+    return FindMatchingRegistryRuleInArray(
+        store->ContainsRules,
+        store->ContainsRuleCount,
+        actualOperation,
+        processName,
+        keyPath,
+        infoClass,
+        valueName,
+        valueData);
+}
+
 NTSTATUS FileFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags) {
     UNREFERENCED_PARAMETER(Flags);
     return STATUS_SUCCESS;
@@ -1194,53 +1285,45 @@ NTSTATUS RegistryCallback(_In_ PVOID CallbackContext, _In_ PVOID Argument1, _In_
         goto Cleanup;
     }
 
-    {
-        AcquireSharedResourceLock(&g_RegistryAllowRuleLock);
-
-        for (ULONG i = 0; i < g_RegistryAllowRuleCount; ++i) {
-            if (MatchRegistryRule(
-                &g_RegistryAllowRules[i],
-                registryOperation,
-                processName,
-                keyPathBuffer,
-                infoClassBuffer,
-                valueNameBuffer,
-                valueDataBuffer)) {
-                CopyWideStringToFixedBuffer(
-                    matchedAllowRuleId,
-                    RTL_NUMBER_OF(matchedAllowRuleId),
-                    g_RegistryAllowRules[i].RuleId);
-                registryAllowMatched = TRUE;
-                break;
-            }
-        }
-
-        ReleaseSharedResourceLock(&g_RegistryAllowRuleLock);
+    PRULE_STORE allowRuleStoreSnapshot = NULL;
+    AcquireRuleStoreSnapshot(&g_RegistryAllowRuleStore, &allowRuleStoreSnapshot);
+    const REGISTRY_RULE* matchedAllowRule = FindMatchingRegistryRuleInStore(
+        allowRuleStoreSnapshot,
+        registryOperation,
+        processName,
+        keyPathBuffer,
+        infoClassBuffer,
+        valueNameBuffer,
+        valueDataBuffer);
+    if (matchedAllowRule != NULL) {
+        CopyWideStringToFixedBuffer(
+            matchedAllowRuleId,
+            RTL_NUMBER_OF(matchedAllowRuleId),
+            matchedAllowRule->RuleId);
+        registryAllowMatched = TRUE;
     }
+    ReleaseRuleStoreSnapshot(allowRuleStoreSnapshot);
 
     if (!registryAllowMatched) {
-        AcquireSharedResourceLock(&g_RegistryRuleLock);
-
-        for (ULONG i = 0; i < g_RegistryRuleCount; ++i) {
-            if (MatchRegistryRule(
-                &g_RegistryRules[i],
-                registryOperation,
-                processName,
-                keyPathBuffer,
-                infoClassBuffer,
-                valueNameBuffer,
-                valueDataBuffer)) {
-                CopyWideStringToFixedBuffer(
-                    matchedRuleId,
-                    RTL_NUMBER_OF(matchedRuleId),
-                    g_RegistryRules[i].RuleId);
-                matchedRuleSeverity = g_RegistryRules[i].Severity;
-                registryRuleMatched = TRUE;
-                break;
-            }
+        PRULE_STORE ruleStoreSnapshot = NULL;
+        AcquireRuleStoreSnapshot(&g_RegistryBlockRuleStore, &ruleStoreSnapshot);
+        const REGISTRY_RULE* matchedRule = FindMatchingRegistryRuleInStore(
+            ruleStoreSnapshot,
+            registryOperation,
+            processName,
+            keyPathBuffer,
+            infoClassBuffer,
+            valueNameBuffer,
+            valueDataBuffer);
+        if (matchedRule != NULL) {
+            CopyWideStringToFixedBuffer(
+                matchedRuleId,
+                RTL_NUMBER_OF(matchedRuleId),
+                matchedRule->RuleId);
+            matchedRuleSeverity = matchedRule->Severity;
+            registryRuleMatched = TRUE;
         }
-
-        ReleaseSharedResourceLock(&g_RegistryRuleLock);
+        ReleaseRuleStoreSnapshot(ruleStoreSnapshot);
     }
     else {
         KdPrint(("[EDR] Allowed registry operation by allow rule. Operation=%lu RuleId=%ws Key=%ws Value=%ws Data=%ws\n",
