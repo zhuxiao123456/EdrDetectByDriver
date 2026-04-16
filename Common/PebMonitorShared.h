@@ -11,6 +11,9 @@
 #define MAX_EVENT_COMMAND_LINE_LENGTH 256
 #define MAX_REGISTRY_RULE_COUNT 256
 
+#define PEBMONITOR_ABI_VERSION 2UL
+#define PEBMONITOR_ABI_IS_COMPAT(v) ((v) == PEBMONITOR_ABI_VERSION)
+
 #define PEB_MONITOR_DEVICE 0x8000
 #define IOCTL_GET_DRIVER_EVENT CTL_CODE(PEB_MONITOR_DEVICE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_ADD_REGISTRY_RULE CTL_CODE(PEB_MONITOR_DEVICE, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -73,11 +76,13 @@ typedef enum _HIPS_PROTECTION_MODE {
     HIPS_MODE_BLOCKING = 1
 } HIPS_PROTECTION_MODE, *PHIPS_PROTECTION_MODE;
 
+#pragma pack(push, 8)
+
 typedef struct _PROCESS_PORT_REQUEST {
     ULONG Version;
     ULONG Flags;
-    ULONGLONG EventId;
-    ULONGLONG CreateTime;
+    ULONG64 EventId;
+    ULONG64 CreateTime;
     ULONG ProcessId;
     ULONG ParentProcessId;
     WCHAR ImagePath[MAX_REG_PATH_LENGTH];
@@ -140,33 +145,42 @@ typedef struct _DRIVER_CONFIG_INFO {
 } DRIVER_CONFIG_INFO, *PDRIVER_CONFIG_INFO;
 
 typedef struct _DRIVER_RUNTIME_STATUS {
+    ULONG AbiVersion;
     ULONG StatusFlags;
     ULONG ProtectionMode;
+    ULONG PolicyEpoch;
     ULONG RegistryRuleCount;
     ULONG RegistryAllowRuleCount;
     ULONG DriverEventQueueCount;
-    ULONGLONG DriverEventDropCount;
-    ULONGLONG DriverEventAllocFailCount;
-    ULONGLONG ProcessVerdictRequestCount;
-    ULONGLONG ProcessVerdictTimeoutCount;
-    ULONGLONG ProcessPortConnectCount;
-    ULONGLONG ProcessPortDisconnectCount;
-    ULONGLONG LastProcessPortConnectTime;
-    ULONGLONG LastProcessPortDisconnectTime;
-    ULONGLONG LastProcessVerdictTimeoutTime;
-    ULONGLONG LastHeartbeatTime;
-    ULONGLONG ProcessBreakerOpenCount;
-    ULONGLONG LastProcessBreakerOpenTime;
-    ULONGLONG LastProcessBreakerCloseTime;
+    ULONG CaptureParentCommandLine;
+    ULONG64 DriverEventDropCount;
+    ULONG64 DriverEventAllocFailCount;
+    ULONG64 ProcessVerdictRequestCount;
+    ULONG64 ProcessVerdictTimeoutCount;
+    ULONG64 ProcessPortConnectCount;
+    ULONG64 ProcessPortDisconnectCount;
+    ULONG64 LastProcessPortConnectTime;
+    ULONG64 LastProcessPortDisconnectTime;
+    ULONG64 LastProcessVerdictTimeoutTime;
+    ULONG64 LastHeartbeatTime;
+    ULONG64 ProcessBreakerOpenCount;
+    ULONG64 LastProcessBreakerOpenTime;
+    ULONG64 LastProcessBreakerCloseTime;
+    ULONG64 FastPathHitCount;
+    ULONG64 CacheHitCount;
+    ULONG64 CacheMissCount;
+    ULONG64 CacheFlushCount;
+    ULONG64 SlowPathCount;
     ULONG ProcessVerdictTimeoutMs;
     ULONG ProcessVerdictFailMode;
     ULONG HeartbeatIntervalMs;
     ULONG HeartbeatTimeoutMs;
-    ULONG CaptureParentCommandLine;
     WCHAR ConfigVersion[MAX_RULE_LENGTH];
     WCHAR ProfileName[MAX_RULE_LENGTH];
     WCHAR GeneratedAt[MAX_RULE_LENGTH];
 } DRIVER_RUNTIME_STATUS, *PDRIVER_RUNTIME_STATUS;
+
+#pragma pack(pop)
 
 static_assert(sizeof(PROCESS_PORT_REQUEST) == 6176, "Unexpected PROCESS_PORT_REQUEST size");
 static_assert(sizeof(PROCESS_PORT_REPLY) == 8, "Unexpected PROCESS_PORT_REPLY size");
@@ -174,4 +188,6 @@ static_assert(sizeof(EDR_TERMINATE_PROCESS_REQUEST) == 8, "Unexpected EDR_TERMIN
 static_assert(sizeof(DRIVER_EVENT) == 3868, "Unexpected DRIVER_EVENT size");
 static_assert(sizeof(REGISTRY_RULE) == 3360, "Unexpected REGISTRY_RULE size");
 static_assert(sizeof(DRIVER_CONFIG_INFO) == 1548, "Unexpected DRIVER_CONFIG_INFO size");
-static_assert(sizeof(DRIVER_RUNTIME_STATUS) == 1688, "Unexpected DRIVER_RUNTIME_STATUS size");
+static_assert(FIELD_OFFSET(DRIVER_RUNTIME_STATUS, AbiVersion) == 0, "AbiVersion must be the first field");
+static_assert(FIELD_OFFSET(DRIVER_RUNTIME_STATUS, PolicyEpoch) == 12, "Unexpected PolicyEpoch offset");
+static_assert(sizeof(DRIVER_RUNTIME_STATUS) == 1728, "Unexpected DRIVER_RUNTIME_STATUS size");
