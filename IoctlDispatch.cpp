@@ -3,8 +3,37 @@
 EXTERN_C POBJECT_TYPE* PsProcessType;
 EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
+static const UNICODE_STRING g_ProtectedProcessPathSuffixes[] = {
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\smss.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\csrss.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\wininit.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\winlogon.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\services.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\lsass.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\svchost.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\dwm.exe"),
+    RTL_CONSTANT_STRING(L"\\Windows\\System32\\spoolsv.exe")
+};
+
+static const CHAR* const g_ProtectedProcessShortNames[] = {
+    "system",
+    "smss.exe",
+    "csrss.exe",
+    "wininit.exe",
+    "winlogon.exe",
+    "services.exe",
+    "lsass.exe",
+    "svchost.exe",
+    "dwm.exe",
+    "spoolsv.exe"
+};
+
 static ULONGLONG ReadInterlockedCounter64(_In_ volatile LONG64* counter) {
     return (ULONGLONG)InterlockedCompareExchange64(counter, 0, 0);
+}
+
+static ULONG ReadInterlockedFlags(_In_ volatile LONG* value) {
+    return (ULONG)InterlockedCompareExchange(value, 0, 0);
 }
 
 static CHAR ToLowerAnsiCharacter(_In_ CHAR character) {
@@ -54,32 +83,90 @@ static VOID CopyAnsiStringToWideBuffer(
     buffer[index] = L'\0';
 }
 
-static VOID CopyAnsiStringToFixedBuffer(
-    _Out_writes_(bufferLength) CHAR* buffer,
+static VOID CopyWideStringToFixedBuffer(
+    _Out_writes_(bufferLength) WCHAR* buffer,
     _In_ SIZE_T bufferLength,
-    _In_opt_z_ PCSTR source) {
+    _In_opt_z_ PCWSTR source) {
     if (buffer == NULL || bufferLength == 0) {
         return;
     }
 
-    buffer[0] = '\0';
+    buffer[0] = L'\0';
     if (source == NULL) {
         return;
     }
 
     SIZE_T index = 0;
-    while (index + 1 < bufferLength && source[index] != '\0') {
+    while (index + 1 < bufferLength && source[index] != L'\0') {
         buffer[index] = source[index];
         index++;
     }
 
-    buffer[index] = '\0';
+    buffer[index] = L'\0';
+}
+
+static VOID CopyUnicodeFileNameToFixedBuffer(
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_opt_ PCUNICODE_STRING path) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    if (path == NULL || path->Buffer == NULL || path->Length == 0) {
+        return;
+    }
+
+    USHORT startIndex = 0;
+    USHORT characterCount = (USHORT)(path->Length / sizeof(WCHAR));
+    for (USHORT index = 0; index < characterCount; ++index) {
+        if (path->Buffer[index] == L'\\' || path->Buffer[index] == L'/') {
+            startIndex = (USHORT)(index + 1);
+        }
+    }
+
+    SIZE_T writeIndex = 0;
+    while (writeIndex + 1 < bufferLength && (startIndex + writeIndex) < characterCount) {
+        buffer[writeIndex] = path->Buffer[startIndex + writeIndex];
+        writeIndex++;
+    }
+
+    buffer[writeIndex] = L'\0';
+}
+
+static BOOLEAN IsProtectedShortImageName(_In_opt_z_ PCSTR imageName) {
+    if (imageName == NULL || imageName[0] == '\0') {
+        return FALSE;
+    }
+
+    for (ULONG index = 0; index < RTL_NUMBER_OF(g_ProtectedProcessShortNames); ++index) {
+        if (AsciiEqualsInsensitive(imageName, g_ProtectedProcessShortNames[index])) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN IsProtectedFullImagePath(_In_ PCUNICODE_STRING imagePath) {
+    if (imagePath == NULL || imagePath->Buffer == NULL || imagePath->Length == 0) {
+        return FALSE;
+    }
+
+    for (ULONG index = 0; index < RTL_NUMBER_OF(g_ProtectedProcessPathSuffixes); ++index) {
+        if (RtlSuffixUnicodeString(&g_ProtectedProcessPathSuffixes[index], imagePath, TRUE)) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 static VOID QueueResponseActionEvent(
     _In_ ULONG responseAction,
     _In_ ULONG processId,
-    _In_opt_z_ PCSTR processNameAnsi,
+    _In_opt_z_ PCWSTR processName,
     _In_ NTSTATUS responseStatus) {
     PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
     if (node == NULL) {
@@ -91,10 +178,10 @@ static VOID QueueResponseActionEvent(
     node->EventData.ProcessId = processId;
     node->EventData.ResponseAction = responseAction;
     node->EventData.ResponseStatus = responseStatus;
-    CopyAnsiStringToWideBuffer(
+    CopyWideStringToFixedBuffer(
         node->EventData.ProcessName,
         RTL_NUMBER_OF(node->EventData.ProcessName),
-        processNameAnsi);
+        processName);
 
     KIRQL oldIrql;
     PIRP irpToComplete = NULL;
@@ -132,29 +219,44 @@ static VOID QueueResponseActionEvent(
     }
 }
 
-static BOOLEAN IsProtectedTargetProcess(_In_ ULONG processId, _In_opt_z_ PCSTR imageName) {
-    static const CHAR* const protectedNames[] = {
-        "system",
-        "smss.exe",
-        "csrss.exe",
-        "wininit.exe",
-        "winlogon.exe",
-        "services.exe",
-        "lsass.exe"
-    };
-
-    if (processId == 0 || processId == 4) {
-        return TRUE;
-    }
-
-    if (imageName == NULL || imageName[0] == '\0') {
+static BOOLEAN IsProtectedTargetProcess(
+    _In_ ULONG processId,
+    _In_opt_ PEPROCESS process,
+    _Out_writes_(displayNameLength) WCHAR* displayName,
+    _In_ SIZE_T displayNameLength) {
+    if (displayName == NULL || displayNameLength == 0) {
         return FALSE;
     }
 
-    for (ULONG index = 0; index < RTL_NUMBER_OF(protectedNames); ++index) {
-        if (AsciiEqualsInsensitive(imageName, protectedNames[index])) {
+    displayName[0] = L'\0';
+    if (processId == 0 || processId == 4) {
+        CopyWideStringToFixedBuffer(displayName, displayNameLength, L"system");
+        return TRUE;
+    }
+
+    if (process == NULL) {
+        return FALSE;
+    }
+
+    PUNICODE_STRING imagePath = NULL;
+    if (NT_SUCCESS(QueryProcessImageNameCompat(process, &imagePath)) &&
+        imagePath != NULL &&
+        imagePath->Buffer != NULL &&
+        imagePath->Length > 0) {
+        CopyUnicodeFileNameToFixedBuffer(displayName, displayNameLength, imagePath);
+        BOOLEAN isProtected = IsProtectedFullImagePath(imagePath);
+        ExFreePool(imagePath);
+        if (isProtected) {
             return TRUE;
         }
+
+        return FALSE;
+    }
+
+    PCHAR imageName = PsGetProcessImageFileName(process);
+    if (imageName != NULL && imageName[0] != '\0') {
+        CopyAnsiStringToWideBuffer(displayName, displayNameLength, imageName);
+        return IsProtectedShortImageName(imageName);
     }
 
     return FALSE;
@@ -172,16 +274,13 @@ static NTSTATUS TerminateTargetProcessById(_In_ ULONG processId, _In_ LONG exitS
         return status;
     }
 
-    PCHAR imageName = PsGetProcessImageFileName(process);
-    CHAR imageNameCopy[16] = {};
-    CopyAnsiStringToFixedBuffer(imageNameCopy, RTL_NUMBER_OF(imageNameCopy), imageName);
-
-    if (IsProtectedTargetProcess(processId, imageNameCopy)) {
-        KdPrint(("[PebMonitor] WARN: Rejecting terminate request for protected process. PID=%lu Image=%s\n",
+    WCHAR imageNameBuffer[MAX_RULE_LENGTH] = {};
+    if (IsProtectedTargetProcess(processId, process, imageNameBuffer, RTL_NUMBER_OF(imageNameBuffer))) {
+        KdPrint(("[PebMonitor] WARN: Rejecting terminate request for protected process. PID=%lu Image=%ws\n",
             processId,
-            (imageNameCopy[0] != '\0') ? imageNameCopy : "<unknown>"));
+            (imageNameBuffer[0] != L'\0') ? imageNameBuffer : L"<unknown>"));
         ObDereferenceObject(process);
-        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameCopy, STATUS_ACCESS_DENIED);
+        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameBuffer, STATUS_ACCESS_DENIED);
         return STATUS_ACCESS_DENIED;
     }
 
@@ -200,7 +299,7 @@ static NTSTATUS TerminateTargetProcessById(_In_ ULONG processId, _In_ LONG exitS
         KdPrint(("[PebMonitor] WARN: Failed to open process for terminate. PID=%lu Status=0x%08X\n",
             processId,
             status));
-        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameCopy, status);
+        QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameBuffer, status);
         return status;
     }
 
@@ -211,15 +310,21 @@ static NTSTATUS TerminateTargetProcessById(_In_ ULONG processId, _In_ LONG exitS
         processId,
         status,
         (ULONG)exitStatus));
-    QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameCopy, status);
+    QueueResponseActionEvent(RESPONSE_ACTION_TERMINATE_PROCESS, processId, imageNameBuffer, status);
     return status;
 }
 
 static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) {
     RtlZeroMemory(runtimeStatus, sizeof(DRIVER_RUNTIME_STATUS));
 
-    AcquireSharedPushLock(&g_RuntimeStatusLock);
-    runtimeStatus->StatusFlags = g_RuntimeStatusFlags;
+    runtimeStatus->StatusFlags = ReadInterlockedFlags((volatile LONG*)&g_RuntimeStatusFlags);
+    runtimeStatus->ProtectionMode = (ULONG)g_ProtectionMode;
+    runtimeStatus->LastHeartbeatTime = ReadInterlockedCounter64(&g_LastHeartbeatTime);
+    runtimeStatus->ProcessBreakerOpenCount = ReadInterlockedCounter64(&g_ProcessBreakerOpenCount);
+    runtimeStatus->LastProcessBreakerOpenTime = ReadInterlockedCounter64(&g_LastProcessBreakerOpenTime);
+    runtimeStatus->LastProcessBreakerCloseTime = ReadInterlockedCounter64(&g_LastProcessBreakerCloseTime);
+
+    AcquireSharedResourceLock(&g_RuntimeStatusLock);
     runtimeStatus->ProcessVerdictRequestCount = g_ProcessVerdictRequestCount;
     runtimeStatus->ProcessVerdictTimeoutCount = g_ProcessVerdictTimeoutCount;
     runtimeStatus->ProcessPortConnectCount = g_ProcessPortConnectCount;
@@ -229,19 +334,21 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
     runtimeStatus->LastProcessVerdictTimeoutTime = g_LastProcessVerdictTimeoutTime;
     runtimeStatus->ProcessVerdictTimeoutMs = g_ProcessVerdictTimeoutMs;
     runtimeStatus->ProcessVerdictFailMode = g_ProcessVerdictFailMode;
+    runtimeStatus->HeartbeatIntervalMs = g_HeartbeatIntervalMs;
+    runtimeStatus->HeartbeatTimeoutMs = g_HeartbeatTimeoutMs;
     runtimeStatus->CaptureParentCommandLine = g_CaptureParentCommandLine;
     RtlStringCchCopyW(runtimeStatus->ConfigVersion, RTL_NUMBER_OF(runtimeStatus->ConfigVersion), g_ActiveConfigVersion);
     RtlStringCchCopyW(runtimeStatus->ProfileName, RTL_NUMBER_OF(runtimeStatus->ProfileName), g_ActiveProfileName);
     RtlStringCchCopyW(runtimeStatus->GeneratedAt, RTL_NUMBER_OF(runtimeStatus->GeneratedAt), g_ActiveGeneratedAt);
-    ReleaseSharedPushLock(&g_RuntimeStatusLock);
+    ReleaseSharedResourceLock(&g_RuntimeStatusLock);
 
-    AcquireSharedPushLock(&g_RegistryRuleLock);
+    AcquireSharedResourceLock(&g_RegistryRuleLock);
     runtimeStatus->RegistryRuleCount = g_RegistryRuleCount;
-    ReleaseSharedPushLock(&g_RegistryRuleLock);
+    ReleaseSharedResourceLock(&g_RegistryRuleLock);
 
-    AcquireSharedPushLock(&g_RegistryAllowRuleLock);
+    AcquireSharedResourceLock(&g_RegistryAllowRuleLock);
     runtimeStatus->RegistryAllowRuleCount = g_RegistryAllowRuleCount;
-    ReleaseSharedPushLock(&g_RegistryAllowRuleLock);
+    ReleaseSharedResourceLock(&g_RegistryAllowRuleLock);
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);
@@ -324,7 +431,7 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             captureParentCmdline = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
         }
 
-        AcquireExclusivePushLock(&g_RuntimeStatusLock);
+        AcquireExclusiveResourceLock(&g_RuntimeStatusLock);
         RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
         RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
         RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
@@ -334,8 +441,15 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         RtlStringCchCopyW(g_ActiveConfigVersion, RTL_NUMBER_OF(g_ActiveConfigVersion), configInfo->ConfigVersion);
         RtlStringCchCopyW(g_ActiveProfileName, RTL_NUMBER_OF(g_ActiveProfileName), configInfo->ProfileName);
         RtlStringCchCopyW(g_ActiveGeneratedAt, RTL_NUMBER_OF(g_ActiveGeneratedAt), configInfo->GeneratedAt);
-        ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+        ReleaseExclusiveResourceLock(&g_RuntimeStatusLock);
 
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = 0;
+        break;
+    }
+
+    case IOCTL_HIPS_HEARTBEAT: {
+        RecordProcessHeartbeatEvent();
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
@@ -410,33 +524,34 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             break;
         }
         PREGISTRY_RULE rule = (PREGISTRY_RULE)Irp->AssociatedIrp.SystemBuffer;
+        REGISTRY_RULE sanitizedRule = *rule;
 
-        rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
-        rule->ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
-        rule->InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->ValueName[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->ValueData[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
+        sanitizedRule.ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
+        sanitizedRule.InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.ValueName[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.ValueData[MAX_RULE_LENGTH - 1] = L'\0';
 
-        AcquireExclusivePushLock(&g_RegistryRuleLock);
+        AcquireExclusiveResourceLock(&g_RegistryRuleLock);
         if (g_RegistryRuleCount < MAX_REGISTRY_RULE_COUNT) {
-            RtlCopyMemory(&g_RegistryRules[g_RegistryRuleCount], rule, sizeof(REGISTRY_RULE));
+            RtlCopyMemory(&g_RegistryRules[g_RegistryRuleCount], &sanitizedRule, sizeof(REGISTRY_RULE));
             g_RegistryRuleCount++;
             status = STATUS_SUCCESS;
         }
         else {
             status = STATUS_INSUFFICIENT_RESOURCES;
         }
-        ReleaseExclusivePushLock(&g_RegistryRuleLock);
+        ReleaseExclusiveResourceLock(&g_RegistryRuleLock);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_REGISTRY_RULES: {
-        AcquireExclusivePushLock(&g_RegistryRuleLock);
+        AcquireExclusiveResourceLock(&g_RegistryRuleLock);
         g_RegistryRuleCount = 0;
         RtlZeroMemory(g_RegistryRules, sizeof(g_RegistryRules));
-        ReleaseExclusivePushLock(&g_RegistryRuleLock);
+        ReleaseExclusiveResourceLock(&g_RegistryRuleLock);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;
@@ -448,33 +563,34 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             break;
         }
         PREGISTRY_RULE rule = (PREGISTRY_RULE)Irp->AssociatedIrp.SystemBuffer;
+        REGISTRY_RULE sanitizedRule = *rule;
 
-        rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
-        rule->ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
-        rule->InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->ValueName[MAX_RULE_LENGTH - 1] = L'\0';
-        rule->ValueData[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
+        sanitizedRule.ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
+        sanitizedRule.InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.ValueName[MAX_RULE_LENGTH - 1] = L'\0';
+        sanitizedRule.ValueData[MAX_RULE_LENGTH - 1] = L'\0';
 
-        AcquireExclusivePushLock(&g_RegistryAllowRuleLock);
+        AcquireExclusiveResourceLock(&g_RegistryAllowRuleLock);
         if (g_RegistryAllowRuleCount < MAX_REGISTRY_RULE_COUNT) {
-            RtlCopyMemory(&g_RegistryAllowRules[g_RegistryAllowRuleCount], rule, sizeof(REGISTRY_RULE));
+            RtlCopyMemory(&g_RegistryAllowRules[g_RegistryAllowRuleCount], &sanitizedRule, sizeof(REGISTRY_RULE));
             g_RegistryAllowRuleCount++;
             status = STATUS_SUCCESS;
         }
         else {
             status = STATUS_INSUFFICIENT_RESOURCES;
         }
-        ReleaseExclusivePushLock(&g_RegistryAllowRuleLock);
+        ReleaseExclusiveResourceLock(&g_RegistryAllowRuleLock);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_REGISTRY_ALLOW_RULES: {
-        AcquireExclusivePushLock(&g_RegistryAllowRuleLock);
+        AcquireExclusiveResourceLock(&g_RegistryAllowRuleLock);
         g_RegistryAllowRuleCount = 0;
         RtlZeroMemory(g_RegistryAllowRules, sizeof(g_RegistryAllowRules));
-        ReleaseExclusivePushLock(&g_RegistryAllowRuleLock);
+        ReleaseExclusiveResourceLock(&g_RegistryAllowRuleLock);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = 0;
         break;

@@ -2,14 +2,11 @@
 #include "PebMonitor.h"
 
 #include <initguid.h>
-#include <wdmsec.h>
-
-DEFINE_GUID(GUID_SD_PEBMONITOR, 0x8a923a1c, 0xc1d5, 0x4f2b, 0x9b, 0x11, 0x72, 0xa1, 0xd8, 0x3e, 0x5a, 0x9f);
 
 PDEVICE_OBJECT g_DeviceObject = NULL;
 EX_RUNDOWN_REF g_RundownRef;
 volatile LONG64 g_NextProcessEventId = 0;
-EX_PUSH_LOCK g_ProcessPortLock = 0;
+ERESOURCE g_ProcessPortLock = {};
 PFLT_PORT g_ProcessServerPort = NULL;
 PFLT_PORT g_ProcessClientPort = NULL;
 
@@ -23,15 +20,16 @@ NPAGED_LOOKASIDE_LIST g_DriverEventLookaside;
 
 REGISTRY_RULE g_RegistryRules[MAX_REGISTRY_RULE_COUNT];
 ULONG g_RegistryRuleCount = 0;
-EX_PUSH_LOCK g_RegistryRuleLock = 0;
+ERESOURCE g_RegistryRuleLock = {};
 
 REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
 ULONG g_RegistryAllowRuleCount = 0;
-EX_PUSH_LOCK g_RegistryAllowRuleLock = 0;
+ERESOURCE g_RegistryAllowRuleLock = {};
 
 LARGE_INTEGER g_RegCookie = { 0 };
 ULONG g_RuntimeStatusFlags = 0;
-EX_PUSH_LOCK g_RuntimeStatusLock = 0;
+HIPS_PROTECTION_MODE g_ProtectionMode = HIPS_MODE_BLOCKING;
+ERESOURCE g_RuntimeStatusLock = {};
 ULONGLONG g_ProcessVerdictRequestCount = 0;
 ULONGLONG g_ProcessVerdictTimeoutCount = 0;
 ULONGLONG g_ProcessPortConnectCount = 0;
@@ -39,31 +37,67 @@ ULONGLONG g_ProcessPortDisconnectCount = 0;
 ULONGLONG g_LastProcessPortConnectTime = 0;
 ULONGLONG g_LastProcessPortDisconnectTime = 0;
 ULONGLONG g_LastProcessVerdictTimeoutTime = 0;
+volatile LONG g_ProcessVerdictBreakerOpen = 0;
+volatile LONG g_ProcessPortConnected = 0;
+volatile LONG64 g_LastHeartbeatInterruptTime = 0;
+volatile LONG64 g_LastHeartbeatTime = 0;
+volatile LONG64 g_ProcessBreakerOpenCount = 0;
+volatile LONG64 g_LastProcessBreakerOpenTime = 0;
+volatile LONG64 g_LastProcessBreakerCloseTime = 0;
 ULONG g_ProcessVerdictTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
 ULONG g_ProcessVerdictFailMode = PROCESS_VERDICT_FAIL_OPEN;
+ULONG g_HeartbeatIntervalMs = PROCESS_HEARTBEAT_INTERVAL_MS_DEFAULT;
+ULONG g_HeartbeatTimeoutMs = PROCESS_HEARTBEAT_TIMEOUT_MS_DEFAULT;
 ULONG g_CaptureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
 WCHAR g_ActiveConfigVersion[MAX_RULE_LENGTH];
 WCHAR g_ActiveProfileName[MAX_RULE_LENGTH];
 WCHAR g_ActiveGeneratedAt[MAX_RULE_LENGTH];
 PFLT_FILTER g_FilterHandle = NULL;
+KTIMER g_HeartbeatCheckTimer = {};
+KDPC g_HeartbeatCheckDpc = {};
+
+static LONG ReadInterlockedLong(_In_ volatile LONG* value) {
+    return InterlockedCompareExchange(value, 0, 0);
+}
+
+static ULONGLONG ReadInterlockedCounter64(_In_ volatile LONG64* value) {
+    return (ULONGLONG)InterlockedCompareExchange64(value, 0, 0);
+}
 
 static VOID SetRuntimeStatusFlag(_In_ ULONG flag, _In_ BOOLEAN enabled) {
-    AcquireExclusivePushLock(&g_RuntimeStatusLock);
     if (enabled) {
-        g_RuntimeStatusFlags |= flag;
+        InterlockedOr((volatile LONG*)&g_RuntimeStatusFlags, (LONG)flag);
     }
     else {
-        g_RuntimeStatusFlags &= ~flag;
+        InterlockedAnd((volatile LONG*)&g_RuntimeStatusFlags, ~((LONG)flag));
     }
-    ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+}
+
+static VOID InitializeProtectionMode() {
+    HIPS_PROTECTION_MODE protectionMode = HIPS_MODE_BLOCKING;
+
+    if (g_ApiSupport.OsMajorVersion < 6 ||
+        (g_ApiSupport.OsMajorVersion == 6 && g_ApiSupport.OsMinorVersion <= 1)) {
+        protectionMode = HIPS_MODE_MONITOR_ONLY;
+    }
+
+    g_ProtectionMode = protectionMode;
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_MONITOR_ONLY, protectionMode == HIPS_MODE_MONITOR_ONLY);
+
+    KdPrint((
+        "[PebMonitor] INFO: Protection mode initialized. Mode=%s OS=%lu.%lu build=%lu\n",
+        (protectionMode == HIPS_MODE_MONITOR_ONLY) ? "monitor_only" : "blocking",
+        g_ApiSupport.OsMajorVersion,
+        g_ApiSupport.OsMinorVersion,
+        g_ApiSupport.OsBuildNumber));
 }
 
 static VOID ResetRuntimeConfigInfo() {
-    AcquireExclusivePushLock(&g_RuntimeStatusLock);
+    AcquireExclusiveResourceLock(&g_RuntimeStatusLock);
     RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
     RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
     RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
-    ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+    ReleaseExclusiveResourceLock(&g_RuntimeStatusLock);
 }
 
 static ULONGLONG QueryCurrentSystemTimeValue() {
@@ -72,35 +106,109 @@ static ULONGLONG QueryCurrentSystemTimeValue() {
     return (ULONGLONG)now.QuadPart;
 }
 
+static ULONGLONG QueryCurrentInterruptTimeValue() {
+    return KeQueryInterruptTime();
+}
+
+static VOID OpenProcessVerdictBreaker(_In_ ULONGLONG nowWallTime) {
+    if (InterlockedCompareExchange(&g_ProcessVerdictBreakerOpen, 1, 0) != 0) {
+        return;
+    }
+
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_BREAKER_OPEN, TRUE);
+    InterlockedIncrement64(&g_ProcessBreakerOpenCount);
+    InterlockedExchange64(&g_LastProcessBreakerOpenTime, (LONG64)nowWallTime);
+    KdPrint(("[PebMonitor] WARN: Process verdict breaker opened; process create path is fail-open until heartbeat recovery.\n"));
+}
+
+static VOID CloseProcessVerdictBreaker(_In_ ULONGLONG nowWallTime) {
+    if (InterlockedCompareExchange(&g_ProcessVerdictBreakerOpen, 0, 1) != 1) {
+        return;
+    }
+
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_BREAKER_OPEN, FALSE);
+    InterlockedExchange64(&g_LastProcessBreakerCloseTime, (LONG64)nowWallTime);
+    KdPrint(("[PebMonitor] INFO: Process verdict breaker closed after heartbeat recovery.\n"));
+}
+
+VOID RecordProcessHeartbeatEvent() {
+    ULONGLONG nowInterruptTime = QueryCurrentInterruptTimeValue();
+    ULONGLONG nowWallTime = QueryCurrentSystemTimeValue();
+    InterlockedExchange64(&g_LastHeartbeatInterruptTime, (LONG64)nowInterruptTime);
+    InterlockedExchange64(&g_LastHeartbeatTime, (LONG64)nowWallTime);
+    CloseProcessVerdictBreaker(nowWallTime);
+}
+
+static VOID HeartbeatCheckDpcRoutine(
+    _In_ struct _KDPC* Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2) {
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(DeferredContext);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    if (ReadInterlockedLong(&g_ProcessPortConnected) == 0) {
+        return;
+    }
+
+    if (ReadInterlockedLong(&g_ProcessVerdictBreakerOpen) != 0) {
+        return;
+    }
+
+    ULONGLONG lastHeartbeat = ReadInterlockedCounter64(&g_LastHeartbeatInterruptTime);
+    if (lastHeartbeat == 0) {
+        return;
+    }
+
+    ULONGLONG timeoutTicks = (ULONGLONG)g_HeartbeatTimeoutMs * 10ULL * 1000ULL;
+    ULONGLONG nowInterruptTime = QueryCurrentInterruptTimeValue();
+    if (nowInterruptTime > lastHeartbeat &&
+        (nowInterruptTime - lastHeartbeat) > timeoutTicks) {
+        OpenProcessVerdictBreaker(QueryCurrentSystemTimeValue());
+    }
+}
+
 static VOID RecordProcessPortConnectEvent() {
-    AcquireExclusivePushLock(&g_RuntimeStatusLock);
-    g_RuntimeStatusFlags |= DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED;
+    ULONGLONG nowWallTime = QueryCurrentSystemTimeValue();
+    InterlockedExchange(&g_ProcessPortConnected, 1);
+    InterlockedExchange64(&g_LastHeartbeatInterruptTime, (LONG64)QueryCurrentInterruptTimeValue());
+    InterlockedExchange64(&g_LastHeartbeatTime, (LONG64)nowWallTime);
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED, TRUE);
+    CloseProcessVerdictBreaker(nowWallTime);
+
+    AcquireExclusiveResourceLock(&g_RuntimeStatusLock);
     g_ProcessPortConnectCount++;
-    g_LastProcessPortConnectTime = QueryCurrentSystemTimeValue();
-    ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+    g_LastProcessPortConnectTime = nowWallTime;
+    ReleaseExclusiveResourceLock(&g_RuntimeStatusLock);
 }
 
 static VOID RecordProcessPortDisconnectEvent() {
-    AcquireExclusivePushLock(&g_RuntimeStatusLock);
+    InterlockedExchange(&g_ProcessPortConnected, 0);
+    InterlockedExchange64(&g_LastHeartbeatInterruptTime, 0);
+
+    AcquireExclusiveResourceLock(&g_RuntimeStatusLock);
     if ((g_RuntimeStatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) != 0) {
-        g_RuntimeStatusFlags &= ~DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED;
         g_ProcessPortDisconnectCount++;
         g_LastProcessPortDisconnectTime = QueryCurrentSystemTimeValue();
     }
-    ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+    ReleaseExclusiveResourceLock(&g_RuntimeStatusLock);
+
+    SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED, FALSE);
 }
 
 VOID RecordProcessVerdictRequestEvent() {
-    AcquireExclusivePushLock(&g_RuntimeStatusLock);
+    AcquireExclusiveResourceLock(&g_RuntimeStatusLock);
     g_ProcessVerdictRequestCount++;
-    ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+    ReleaseExclusiveResourceLock(&g_RuntimeStatusLock);
 }
 
 VOID RecordProcessVerdictTimeoutEvent() {
-    AcquireExclusivePushLock(&g_RuntimeStatusLock);
+    AcquireExclusiveResourceLock(&g_RuntimeStatusLock);
     g_ProcessVerdictTimeoutCount++;
     g_LastProcessVerdictTimeoutTime = QueryCurrentSystemTimeValue();
-    ReleaseExclusivePushLock(&g_RuntimeStatusLock);
+    ReleaseExclusiveResourceLock(&g_RuntimeStatusLock);
 }
 
 NTSTATUS ProcessPortConnectNotify(
@@ -117,14 +225,14 @@ NTSTATUS ProcessPortConnectNotify(
         *ConnectionCookie = NULL;
     }
 
-    AcquireExclusivePushLock(&g_ProcessPortLock);
+    AcquireExclusiveResourceLock(&g_ProcessPortLock);
     if (g_ProcessClientPort != NULL) {
-        ReleaseExclusivePushLock(&g_ProcessPortLock);
+        ReleaseExclusiveResourceLock(&g_ProcessPortLock);
         return STATUS_DEVICE_BUSY;
     }
 
     g_ProcessClientPort = ClientPort;
-    ReleaseExclusivePushLock(&g_ProcessPortLock);
+    ReleaseExclusiveResourceLock(&g_ProcessPortLock);
     RecordProcessPortConnectEvent();
     return STATUS_SUCCESS;
 }
@@ -135,17 +243,18 @@ VOID ProcessPortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
     PFLT_PORT clientPort = NULL;
     PFLT_FILTER filterHandle = NULL;
 
-    AcquireExclusivePushLock(&g_ProcessPortLock);
+    AcquireExclusiveResourceLock(&g_ProcessPortLock);
     clientPort = g_ProcessClientPort;
     filterHandle = g_FilterHandle;
     g_ProcessClientPort = NULL;
-    ReleaseExclusivePushLock(&g_ProcessPortLock);
+    ReleaseExclusiveResourceLock(&g_ProcessPortLock);
 
     if (filterHandle != NULL && clientPort != NULL) {
         FltCloseClientPort(filterHandle, &clientPort);
     }
 
     RecordProcessPortDisconnectEvent();
+    KdPrint(("[PebMonitor] WARN: Process verdict port disconnected; process create path is fail-open until reconnect.\n"));
 }
 
 NTSTATUS ProcessPortMessageNotify(
@@ -172,11 +281,11 @@ static VOID CloseProcessCommunicationPorts() {
     PFLT_PORT clientPort = NULL;
     PFLT_FILTER filterHandle = NULL;
 
-    AcquireExclusivePushLock(&g_ProcessPortLock);
+    AcquireExclusiveResourceLock(&g_ProcessPortLock);
     clientPort = g_ProcessClientPort;
     filterHandle = g_FilterHandle;
     g_ProcessClientPort = NULL;
-    ReleaseExclusivePushLock(&g_ProcessPortLock);
+    ReleaseExclusiveResourceLock(&g_ProcessPortLock);
 
     if (filterHandle != NULL && clientPort != NULL) {
         FltCloseClientPort(filterHandle, &clientPort);
@@ -190,6 +299,9 @@ static VOID CloseProcessCommunicationPorts() {
 
 void UnloadDriver(PDRIVER_OBJECT DriverObject) {
     UNREFERENCED_PARAMETER(DriverObject);
+
+    KeCancelTimer(&g_HeartbeatCheckTimer);
+    KeFlushQueuedDpcs();
 
     if (g_FilterHandle != NULL) {
         CloseProcessCommunicationPorts();
@@ -229,6 +341,12 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
     ExDeleteNPagedLookasideList(&g_DriverEventLookaside);
 
+    ResetRuntimeConfigInfo();
+    ExDeleteResourceLite(&g_RuntimeStatusLock);
+    ExDeleteResourceLite(&g_RegistryAllowRuleLock);
+    ExDeleteResourceLite(&g_RegistryRuleLock);
+    ExDeleteResourceLite(&g_ProcessPortLock);
+
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\DosDevices\\PebMonitor");
     IoDeleteSymbolicLink(&symLink);
     if (g_DeviceObject != NULL) {
@@ -236,7 +354,6 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
         g_DeviceObject = NULL;
     }
 
-    ResetRuntimeConfigInfo();
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_DEVICE_READY, FALSE);
 
     KdPrint(("[PebMonitor] INFO: Driver Unloaded Safely.\n"));
@@ -247,6 +364,16 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
 
     DriverObject->DriverUnload = UnloadDriver;
 
+#if defined(PEBMONITOR_BREAK_ON_ENTRY)
+    if (KD_DEBUGGER_ENABLED && !KdRefreshDebuggerNotPresent()) {
+        KdPrint(("[PebMonitor] INFO: Breaking in DriverEntry because PEBMONITOR_BREAK_ON_ENTRY is enabled.\n"));
+        DbgBreakPoint();
+    }
+    else {
+        KdPrint(("[PebMonitor] INFO: PEBMONITOR_BREAK_ON_ENTRY enabled, but no kernel debugger is attached.\n"));
+    }
+#endif
+
     NTSTATUS status = STATUS_SUCCESS;
     BOOLEAN lookasideInitialized = FALSE;
     BOOLEAN deviceCreated = FALSE;
@@ -255,15 +382,19 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN processPortCreated = FALSE;
     BOOLEAN registryCallbackRegistered = FALSE;
     BOOLEAN processCallbackRegistered = FALSE;
+    BOOLEAN processPortLockInitialized = FALSE;
+    BOOLEAN registryRuleLockInitialized = FALSE;
+    BOOLEAN registryAllowRuleLockInitialized = FALSE;
+    BOOLEAN runtimeStatusLockInitialized = FALSE;
     PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     UNICODE_STRING processPortName = { 0 };
     OBJECT_ATTRIBUTES processPortAttributes = { 0 };
     UNICODE_STRING altitude = { 0 };
+    LARGE_INTEGER heartbeatDueTime = {};
     UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\PebMonitor");
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\DosDevices\\PebMonitor");
-    UNICODE_STRING sddl = RTL_CONSTANT_STRING(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-
-    ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+    InitializeApiCompatibility();
+    TryInitializeDriverRuntimeCompat();
 
     InitializeListHead(&g_DriverEventQueue);
     KeInitializeSpinLock(&g_DriverQueueLock);
@@ -280,20 +411,38 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
         0);
     lookasideInitialized = TRUE;
 
-    ExInitializePushLock(&g_ProcessPortLock);
+    status = ExInitializeResourceLite(&g_ProcessPortLock);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    processPortLockInitialized = TRUE;
     g_ProcessServerPort = NULL;
     g_ProcessClientPort = NULL;
+    g_ProcessPortConnected = 0;
 
-    ExInitializePushLock(&g_RegistryRuleLock);
+    status = ExInitializeResourceLite(&g_RegistryRuleLock);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    registryRuleLockInitialized = TRUE;
     g_RegistryRuleCount = 0;
     RtlZeroMemory(g_RegistryRules, sizeof(g_RegistryRules));
 
-    ExInitializePushLock(&g_RegistryAllowRuleLock);
+    status = ExInitializeResourceLite(&g_RegistryAllowRuleLock);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    registryAllowRuleLockInitialized = TRUE;
     g_RegistryAllowRuleCount = 0;
     RtlZeroMemory(g_RegistryAllowRules, sizeof(g_RegistryAllowRules));
 
-    ExInitializePushLock(&g_RuntimeStatusLock);
+    status = ExInitializeResourceLite(&g_RuntimeStatusLock);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    runtimeStatusLockInitialized = TRUE;
     g_RuntimeStatusFlags = 0;
+    g_ProtectionMode = HIPS_MODE_BLOCKING;
     g_ProcessVerdictRequestCount = 0;
     g_ProcessVerdictTimeoutCount = 0;
     g_ProcessPortConnectCount = 0;
@@ -301,25 +450,34 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     g_LastProcessPortConnectTime = 0;
     g_LastProcessPortDisconnectTime = 0;
     g_LastProcessVerdictTimeoutTime = 0;
+    g_ProcessVerdictBreakerOpen = 0;
+    g_LastHeartbeatInterruptTime = 0;
+    g_LastHeartbeatTime = 0;
+    g_ProcessBreakerOpenCount = 0;
+    g_LastProcessBreakerOpenTime = 0;
+    g_LastProcessBreakerCloseTime = 0;
     g_ProcessVerdictTimeoutMs = PROCESS_VERDICT_TIMEOUT_MS_DEFAULT;
     g_ProcessVerdictFailMode = PROCESS_VERDICT_FAIL_OPEN;
+    g_HeartbeatIntervalMs = PROCESS_HEARTBEAT_INTERVAL_MS_DEFAULT;
+    g_HeartbeatTimeoutMs = PROCESS_HEARTBEAT_TIMEOUT_MS_DEFAULT;
     g_CaptureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
     g_NextProcessEventId = 0;
     RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
     RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
     RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
+    KeInitializeTimerEx(&g_HeartbeatCheckTimer, NotificationTimer);
+    KeInitializeDpc(&g_HeartbeatCheckDpc, HeartbeatCheckDpcRoutine, NULL);
+    InitializeProtectionMode();
 
     ExInitializeRundownProtection(&g_RundownRef);
 
-    status = IoCreateDeviceSecure(
+    status = IoCreateDevice(
         DriverObject,
         0,
         &devName,
         FILE_DEVICE_UNKNOWN,
         FILE_DEVICE_SECURE_OPEN,
         FALSE,
-        &sddl,
-        (LPCGUID)&GUID_SD_PEBMONITOR,
         &g_DeviceObject);
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
@@ -394,6 +552,12 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     }
 
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_DEVICE_READY, TRUE);
+    heartbeatDueTime.QuadPart = -((LONGLONG)g_HeartbeatIntervalMs * 10 * 1000);
+    KeSetTimerEx(
+        &g_HeartbeatCheckTimer,
+        heartbeatDueTime,
+        (LONG)g_HeartbeatIntervalMs,
+        &g_HeartbeatCheckDpc);
     KdPrint(("[PebMonitor] INFO: Driver Loaded Successfully with Process + Registry Protection.\n"));
     return STATUS_SUCCESS;
 
@@ -434,6 +598,19 @@ Cleanup:
 
     if (lookasideInitialized) {
         ExDeleteNPagedLookasideList(&g_DriverEventLookaside);
+    }
+
+    if (runtimeStatusLockInitialized) {
+        ExDeleteResourceLite(&g_RuntimeStatusLock);
+    }
+    if (registryAllowRuleLockInitialized) {
+        ExDeleteResourceLite(&g_RegistryAllowRuleLock);
+    }
+    if (registryRuleLockInitialized) {
+        ExDeleteResourceLite(&g_RegistryRuleLock);
+    }
+    if (processPortLockInitialized) {
+        ExDeleteResourceLite(&g_ProcessPortLock);
     }
 
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_DEVICE_READY, FALSE);
