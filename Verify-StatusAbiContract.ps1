@@ -8,6 +8,7 @@ $ErrorActionPreference = 'Stop'
 $sharedHeaderPath = Join-Path $RepoRoot 'Common\PebMonitorShared.h'
 $driverUtilsPath = Join-Path $RepoRoot 'DriverUtils.cpp'
 $hostGuardPath = Join-Path $RepoRoot 'HostGuard.cpp'
+$runtimeCountersTestPath = Join-Path $RepoRoot 'StatusRuntimeCountersTests.ps1'
 
 foreach ($path in @($sharedHeaderPath, $driverUtilsPath, $hostGuardPath)) {
     if (-not (Test-Path $path)) {
@@ -56,6 +57,30 @@ if ($hostGuardText -notmatch 'status\.FastPathHitCount') {
 
 if ($hostGuardText -notmatch 'status\.CacheHitCount') {
     throw 'HostGuard status logging must include CacheHitCount.'
+}
+
+if ($hostGuardText -notmatch 'status-json') {
+    throw 'HostGuard must expose a status-json command for runtime counter regression validation.'
+}
+
+if ($hostGuardText -notmatch '--json') {
+    throw 'HostGuard status command must support a --json switch.'
+}
+
+if ($hostGuardText -notmatch 'fast_path_hit_count') {
+    throw 'HostGuard JSON status output must include fast_path_hit_count.'
+}
+
+if ($hostGuardText -notmatch 'cache_hit_count') {
+    throw 'HostGuard JSON status output must include cache_hit_count.'
+}
+
+if ($hostGuardText -notmatch 'slow_path_count') {
+    throw 'HostGuard JSON status output must include slow_path_count.'
+}
+
+if (-not (Test-Path $runtimeCountersTestPath)) {
+    throw 'StatusRuntimeCountersTests.ps1 must exist for runtime counter regression validation.'
 }
 
 Write-Host '[+] HostGuard ABI/runtime status contract checks passed.'

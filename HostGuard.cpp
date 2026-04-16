@@ -446,7 +446,84 @@ namespace {
         return std::wstring(buffer);
     }
 
-        void LogDriverStatusSnapshot(const DRIVER_RUNTIME_STATUS& status) {
+    json BuildDriverStatusJson(const DRIVER_RUNTIME_STATUS& status) {
+        json driverStatus = json::object();
+
+        driverStatus["abi_version"] = status.AbiVersion;
+        driverStatus["status_flags"] = status.StatusFlags;
+        driverStatus["device_ready"] = (status.StatusFlags & DRIVER_STATUS_FLAG_DEVICE_READY) != 0;
+        driverStatus["process_callback_registered"] =
+            (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED) != 0;
+        driverStatus["registry_callback_registered"] =
+            (status.StatusFlags & DRIVER_STATUS_FLAG_REGISTRY_CALLBACK_REGISTERED) != 0;
+        driverStatus["process_port_connected"] =
+            (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_PORT_CONNECTED) != 0;
+        driverStatus["process_breaker_open"] =
+            (status.StatusFlags & DRIVER_STATUS_FLAG_PROCESS_BREAKER_OPEN) != 0;
+        driverStatus["monitor_only"] = (status.StatusFlags & DRIVER_STATUS_FLAG_MONITOR_ONLY) != 0;
+        driverStatus["protection_mode"] = WStringToUtf8(ProtectionModeToString(status.ProtectionMode));
+        driverStatus["policy_epoch"] = status.PolicyEpoch;
+
+        driverStatus["registry_rule_count"] = status.RegistryRuleCount;
+        driverStatus["registry_allow_rule_count"] = status.RegistryAllowRuleCount;
+        driverStatus["driver_event_queue_count"] = status.DriverEventQueueCount;
+        driverStatus["capture_parent_cmdline"] =
+            (status.CaptureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED);
+
+        driverStatus["driver_event_drop_count"] = status.DriverEventDropCount;
+        driverStatus["driver_event_alloc_fail_count"] = status.DriverEventAllocFailCount;
+        driverStatus["process_verdict_request_count"] = status.ProcessVerdictRequestCount;
+        driverStatus["process_verdict_timeout_count"] = status.ProcessVerdictTimeoutCount;
+        driverStatus["process_port_connect_count"] = status.ProcessPortConnectCount;
+        driverStatus["process_port_disconnect_count"] = status.ProcessPortDisconnectCount;
+        driverStatus["process_breaker_open_count"] = status.ProcessBreakerOpenCount;
+
+        driverStatus["last_process_port_connect_time"] = status.LastProcessPortConnectTime;
+        driverStatus["last_process_port_disconnect_time"] = status.LastProcessPortDisconnectTime;
+        driverStatus["last_process_verdict_timeout_time"] = status.LastProcessVerdictTimeoutTime;
+        driverStatus["last_heartbeat_time"] = status.LastHeartbeatTime;
+        driverStatus["last_process_breaker_open_time"] = status.LastProcessBreakerOpenTime;
+        driverStatus["last_process_breaker_close_time"] = status.LastProcessBreakerCloseTime;
+
+        driverStatus["last_process_port_connect_text"] =
+            WStringToUtf8(FormatDriverSystemTimeValue(status.LastProcessPortConnectTime));
+        driverStatus["last_process_port_disconnect_text"] =
+            WStringToUtf8(FormatDriverSystemTimeValue(status.LastProcessPortDisconnectTime));
+        driverStatus["last_process_verdict_timeout_text"] =
+            WStringToUtf8(FormatDriverSystemTimeValue(status.LastProcessVerdictTimeoutTime));
+        driverStatus["last_heartbeat_text"] =
+            WStringToUtf8(FormatDriverSystemTimeValue(status.LastHeartbeatTime));
+        driverStatus["last_process_breaker_open_text"] =
+            WStringToUtf8(FormatDriverSystemTimeValue(status.LastProcessBreakerOpenTime));
+        driverStatus["last_process_breaker_close_text"] =
+            WStringToUtf8(FormatDriverSystemTimeValue(status.LastProcessBreakerCloseTime));
+
+        driverStatus["process_verdict_timeout_ms"] = status.ProcessVerdictTimeoutMs;
+        driverStatus["process_verdict_fail_mode"] =
+            WStringToUtf8(ProcessVerdictFailModeToString(status.ProcessVerdictFailMode));
+        driverStatus["heartbeat_interval_ms"] = status.HeartbeatIntervalMs;
+        driverStatus["heartbeat_timeout_ms"] = status.HeartbeatTimeoutMs;
+
+        driverStatus["fast_path_hit_count"] = status.FastPathHitCount;
+        driverStatus["cache_hit_count"] = status.CacheHitCount;
+        driverStatus["cache_miss_count"] = status.CacheMissCount;
+        driverStatus["cache_flush_count"] = status.CacheFlushCount;
+        driverStatus["slow_path_count"] = status.SlowPathCount;
+
+        if (status.ConfigVersion[0] != L'\0') {
+            driverStatus["config_version"] = WStringToUtf8(status.ConfigVersion);
+        }
+        if (status.ProfileName[0] != L'\0') {
+            driverStatus["profile_name"] = WStringToUtf8(status.ProfileName);
+        }
+        if (status.GeneratedAt[0] != L'\0') {
+            driverStatus["generated_at"] = WStringToUtf8(status.GeneratedAt);
+        }
+
+        return driverStatus;
+    }
+
+    void LogDriverStatusSnapshot(const DRIVER_RUNTIME_STATUS& status) {
         std::wstring flagsText;
         if (status.StatusFlags & DRIVER_STATUS_FLAG_DEVICE_READY) {
             flagsText += L"device ";
@@ -923,7 +1000,7 @@ static bool TryParseProcessId(const wchar_t* text, DWORD& processId) {
     return true;
 }
 
-static int RunStatusCommand(const std::wstring& rulesPath) {
+static int RunStatusCommand(const std::wstring& rulesPath, bool jsonOutput) {
     RuleConfiguration pendingConfig;
     std::wstring loadError;
     const bool loadSucceeded = g_RuleManager.TryLoadRulesFromJson(rulesPath, pendingConfig, &loadError);
@@ -931,9 +1008,96 @@ static int RunStatusCommand(const std::wstring& rulesPath) {
         SetLogRuleContext(pendingConfig.profileName, pendingConfig.configVersion, pendingConfig.generatedAt);
     }
 
+    std::wstring dataDirectory = GetHostGuardDataDirectory();
+    DWORD hostGuardServiceState = SERVICE_STOPPED;
+    bool hostGuardServiceExists = false;
+    bool hostGuardServiceStateAvailable =
+        QueryWin32ServiceState(kHostGuardServiceName, hostGuardServiceState, hostGuardServiceExists);
+
+    DWORD driverServiceState = SERVICE_STOPPED;
+    bool driverServiceExists = false;
+    bool driverServiceStateAvailable =
+        QueryKernelDriverServiceState(kDriverServiceName, driverServiceState, driverServiceExists);
+
+    std::wstring localDriverPath = FindLocalDriverPath();
+    HANDLE hDevice = OpenDriverDevice();
+
+    if (jsonOutput) {
+        json statusJson = json::object();
+        statusJson["command"] = "status";
+        statusJson["output_mode"] = "json";
+        statusJson["rules_path"] = WStringToUtf8(rulesPath);
+        if (!dataDirectory.empty()) {
+            statusJson["data_directory"] = WStringToUtf8(dataDirectory);
+        }
+
+        statusJson["rules_loaded"] = loadSucceeded;
+        if (!loadSucceeded) {
+            statusJson["rules_error"] =
+                WStringToUtf8(loadError.empty() ? L"rules_load_failed" : loadError);
+            statusJson["rules_file_exists"] = IsFileExists(rulesPath);
+        }
+        else {
+            json ruleSummary = json::object();
+            AppendPrefixedConfigFields(ruleSummary, pendingConfig, nullptr);
+            ruleSummary["process_rule_count"] = pendingConfig.processRules.size();
+            ruleSummary["process_allow_rule_count"] = pendingConfig.processAllowRules.size();
+            ruleSummary["registry_rule_count"] = pendingConfig.registryRuleDefinitions.size();
+            ruleSummary["registry_allow_rule_count"] = pendingConfig.registryAllowRuleDefinitions.size();
+
+            json registryBlockClasses = json::object();
+            AppendRegistryRuleClassStatsFields(registryBlockClasses, pendingConfig.registryRuleClassStats, nullptr);
+            ruleSummary["registry_rule_classes"] = registryBlockClasses;
+
+            json registryAllowClasses = json::object();
+            AppendRegistryRuleClassStatsFields(registryAllowClasses, pendingConfig.registryAllowRuleClassStats, nullptr);
+            ruleSummary["registry_allow_rule_classes"] = registryAllowClasses;
+
+            statusJson["rule_summary"] = ruleSummary;
+        }
+
+        json servicesJson = json::object();
+        servicesJson["hostguard_service_query_ok"] = hostGuardServiceStateAvailable;
+        servicesJson["hostguard_service_exists"] = hostGuardServiceExists;
+        if (hostGuardServiceStateAvailable) {
+            servicesJson["hostguard_service_state"] = WStringToUtf8(ServiceStateToString(hostGuardServiceState));
+        }
+
+        servicesJson["driver_service_query_ok"] = driverServiceStateAvailable;
+        servicesJson["driver_service_exists"] = driverServiceExists;
+        if (driverServiceStateAvailable) {
+            servicesJson["driver_service_state"] = WStringToUtf8(ServiceStateToString(driverServiceState));
+        }
+
+        statusJson["services"] = servicesJson;
+        if (!localDriverPath.empty()) {
+            statusJson["local_driver_path"] = WStringToUtf8(localDriverPath);
+        }
+
+        if (hDevice == INVALID_HANDLE_VALUE) {
+            statusJson["driver_connected"] = false;
+            statusJson["driver_error_code"] = GetLastError();
+            std::cout << statusJson.dump(2) << std::endl;
+            return 0;
+        }
+
+        DRIVER_RUNTIME_STATUS status = {};
+        if (QueryDriverStatus(hDevice, status)) {
+            statusJson["driver_connected"] = true;
+            statusJson["driver_status"] = BuildDriverStatusJson(status);
+        }
+        else {
+            statusJson["driver_connected"] = false;
+            statusJson["driver_error_code"] = GetLastError();
+        }
+
+        CloseHandle(hDevice);
+        std::cout << statusJson.dump(2) << std::endl;
+        return 0;
+    }
+
     LogMessage(L"[*] 正在执行状态检查...");
     LogMessage(L"[*] 规则文件路径: " + rulesPath);
-    std::wstring dataDirectory = GetHostGuardDataDirectory();
     if (!dataDirectory.empty()) {
         LogMessage(L"[*] 预期数据目录: " + dataDirectory);
     }
@@ -950,9 +1114,7 @@ static int RunStatusCommand(const std::wstring& rulesPath) {
         LogConfigSummary(pendingConfig);
     }
 
-    DWORD hostGuardServiceState = SERVICE_STOPPED;
-    bool hostGuardServiceExists = false;
-    if (QueryWin32ServiceState(kHostGuardServiceName, hostGuardServiceState, hostGuardServiceExists)) {
+    if (hostGuardServiceStateAvailable) {
         if (hostGuardServiceExists) {
             LogMessage(L"[+] HostGuard 服务状态: " + ServiceStateToString(hostGuardServiceState));
         }
@@ -961,9 +1123,7 @@ static int RunStatusCommand(const std::wstring& rulesPath) {
         }
     }
 
-    DWORD driverServiceState = SERVICE_STOPPED;
-    bool driverServiceExists = false;
-    if (QueryKernelDriverServiceState(kDriverServiceName, driverServiceState, driverServiceExists)) {
+    if (driverServiceStateAvailable) {
         if (driverServiceExists) {
             LogMessage(L"[+] 驱动服务状态: " + ServiceStateToString(driverServiceState));
         }
@@ -972,7 +1132,6 @@ static int RunStatusCommand(const std::wstring& rulesPath) {
         }
     }
 
-    std::wstring localDriverPath = FindLocalDriverPath();
     if (!localDriverPath.empty()) {
         LogMessage(L"[+] 当前目录驱动文件: " + localDriverPath);
     }
@@ -980,7 +1139,6 @@ static int RunStatusCommand(const std::wstring& rulesPath) {
         LogMessage(L"[!] 当前目录未找到 PebMonitor.sys 或 DriverModule.sys。");
     }
 
-    HANDLE hDevice = OpenDriverDevice();
     if (hDevice == INVALID_HANDLE_VALUE) {
         LogMessage(L"[!] 当前无法连接驱动设备，错误码: " + std::to_wstring(GetLastError()));
         return 0;
@@ -2333,8 +2491,13 @@ int wmain(int argc, wchar_t* argv[]) {
             return RunUninstallServiceCommand();
         }
 
+        if (_wcsicmp(argv[1], L"status-json") == 0) {
+            return RunStatusCommand(rulesPath, true);
+        }
+
         if (_wcsicmp(argv[1], L"status") == 0 || _wcsicmp(argv[1], L"--status") == 0) {
-            return RunStatusCommand(rulesPath);
+            bool jsonOutput = (argc > 2 && _wcsicmp(argv[2], L"--json") == 0);
+            return RunStatusCommand(rulesPath, jsonOutput);
         }
 
         if ((_wcsicmp(argv[1], L"terminate") == 0 || _wcsicmp(argv[1], L"kill") == 0) && argc > 2) {
@@ -2354,6 +2517,8 @@ int wmain(int argc, wchar_t* argv[]) {
             std::wcout << L"  HostGuard.exe stop         停止 HostGuard 服务" << std::endl;
             std::wcout << L"  HostGuard.exe uninstall    卸载 HostGuard 服务" << std::endl;
             std::wcout << L"  HostGuard.exe status       查看规则和驱动状态" << std::endl;
+            std::wcout << L"  HostGuard.exe status --json 输出机器可解析的状态 JSON" << std::endl;
+            std::wcout << L"  HostGuard.exe status-json  输出机器可解析的状态 JSON" << std::endl;
             std::wcout << L"  HostGuard.exe terminate PID 通过驱动强制终止目标进程" << std::endl;
             return 0;
         }
