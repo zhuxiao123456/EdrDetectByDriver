@@ -1329,12 +1329,20 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         return;
     }
 
+    const ULONG currentProcessId = HandleToULong(ProcessId);
+
     if (CreateInfo == NULL) {
+        RemoveFastPathTrustedProcess(currentProcessId);
+        FlushDecisionCacheForProcess(currentProcessId);
         ExReleaseRundownProtection(&g_RundownRef);
         return;
     }
 
     const HANDLE parentProcessId = CreateInfo->ParentProcessId;
+    PROCESS_IDENTITY subjectIdentity = {};
+    BOOLEAN subjectIdentityCaptured = FALSE;
+    DECISION_CACHE_KEY cacheKey = {};
+    BOOLEAN cacheKeyBuilt = FALSE;
 
     if (g_ProtectionMode == HIPS_MODE_MONITOR_ONLY) {
         WCHAR observedImagePath[MAX_REG_PATH_LENGTH] = {};
@@ -1389,6 +1397,43 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     }
     ReleaseSharedResourceLock(&g_RuntimeStatusLock);
 
+    PROCESS_PORT_REQUEST request = {};
+    request.Version = PROCESS_PORT_PROTOCOL_VERSION;
+    request.ProcessId = currentProcessId;
+    request.ParentProcessId = HandleToULong(parentProcessId);
+    if (CreateInfo->FileOpenNameAvailable) {
+        request.Flags |= PROCESS_PORT_REQUEST_FLAG_FILE_OPEN_NAME_AVAILABLE;
+    }
+
+    subjectIdentityCaptured = CaptureProcessIdentityByProcessId(parentProcessId, &subjectIdentity);
+
+    UNICODE_STRING capturedImagePath = {};
+    if (!CaptureUnicodeStringToLocalBuffer(
+        CreateInfo->ImageFileName,
+        request.ImagePath,
+        RTL_NUMBER_OF(request.ImagePath),
+        &capturedImagePath)) {
+        CaptureProcessImagePath(Process, request.ImagePath, RTL_NUMBER_OF(request.ImagePath));
+    }
+
+    if (subjectIdentityCaptured &&
+        EvaluateFastPathProcessCreateAllow(&subjectIdentity)) {
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    cacheKeyBuilt = BuildProcessCreateDecisionCacheKey(
+        subjectIdentityCaptured ? &subjectIdentity : NULL,
+        request.ImagePath,
+        &cacheKey);
+    if (cacheKeyBuilt &&
+        TryGetDecisionCacheAllow(&cacheKey)) {
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    RecordSlowPathProcessVerdict();
+
     PFLT_FILTER filterHandle = NULL;
     PFLT_PORT clientPort = NULL;
 
@@ -1401,7 +1446,7 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         if (failMode == PROCESS_VERDICT_FAIL_CLOSE) {
             CreateInfo->CreationStatus = STATUS_ACCESS_DENIED;
             KdPrint(("[EDR] Process verdict channel offline and fail-close is enabled. PID=%lu\n",
-                HandleToULong(ProcessId)));
+                currentProcessId));
         }
 
         ExReleaseRundownProtection(&g_RundownRef);
@@ -1409,11 +1454,6 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     }
 
     BOOLEAN blockProcess = FALSE;
-    PROCESS_PORT_REQUEST request = {};
-    request.Version = PROCESS_PORT_PROTOCOL_VERSION;
-    if (CreateInfo->FileOpenNameAvailable) {
-        request.Flags |= PROCESS_PORT_REQUEST_FLAG_FILE_OPEN_NAME_AVAILABLE;
-    }
     request.EventId = (ULONGLONG)InterlockedIncrement64(&g_NextProcessEventId);
     if (request.EventId == 0) {
         request.EventId = (ULONGLONG)InterlockedIncrement64(&g_NextProcessEventId);
@@ -1422,17 +1462,6 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     LARGE_INTEGER createTime;
     KeQuerySystemTime(&createTime);
     request.CreateTime = (ULONGLONG)createTime.QuadPart;
-    request.ProcessId = HandleToULong(ProcessId);
-    request.ParentProcessId = HandleToULong(parentProcessId);
-
-    UNICODE_STRING capturedImagePath = {};
-    if (!CaptureUnicodeStringToLocalBuffer(
-        CreateInfo->ImageFileName,
-        request.ImagePath,
-        RTL_NUMBER_OF(request.ImagePath),
-        &capturedImagePath)) {
-        CaptureProcessImagePath(Process, request.ImagePath, RTL_NUMBER_OF(request.ImagePath));
-    }
 
     CaptureProcessImagePathByProcessId(
         parentProcessId,
@@ -1483,12 +1512,15 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
 
     if (NT_SUCCESS(sendStatus) &&
         replyLength >= sizeof(PROCESS_PORT_REPLY) &&
-        reply.Version == PROCESS_PORT_PROTOCOL_VERSION &&
-        reply.BlockProcess != 0) {
-        blockProcess = TRUE;
+        reply.Version == PROCESS_PORT_PROTOCOL_VERSION) {
+        if (reply.BlockProcess != 0) {
+            blockProcess = TRUE;
+        }
+        else if (cacheKeyBuilt) {
+            RememberAllowedProcessCreateDecision(&cacheKey);
+        }
     }
-    else if (!NT_SUCCESS(sendStatus) || replyLength < sizeof(PROCESS_PORT_REPLY) ||
-        reply.Version != PROCESS_PORT_PROTOCOL_VERSION) {
+    else {
         if (sendStatus == STATUS_TIMEOUT) {
             RecordProcessVerdictTimeoutEvent();
             KdPrint(("[EDR] Process verdict wait timed out. PID=%lu EventId=%llu TimeoutMs=%lu FailMode=%lu\n",
@@ -1519,4 +1551,3 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
 
     ExReleaseRundownProtection(&g_RundownRef);
 }
-

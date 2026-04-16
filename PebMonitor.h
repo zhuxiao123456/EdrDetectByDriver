@@ -4,6 +4,9 @@
 #include <ntimage.h>
 #include "ApiCompatibility.h"
 #include "Shared.h"
+#include "FastPath.h"
+#include "DecisionCache.h"
+#include "RuleStore.h"
 
 #ifndef PROCESS_TERMINATE
 #define PROCESS_TERMINATE (0x0001)
@@ -67,11 +70,15 @@ extern ERESOURCE g_RegistryRuleLock;
 extern REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
 extern ULONG g_RegistryAllowRuleCount;
 extern ERESOURCE g_RegistryAllowRuleLock;
+extern ERESOURCE g_RuleStoreStateLock;
+extern PRULE_STORE volatile g_RegistryBlockRuleStore;
+extern PRULE_STORE volatile g_RegistryAllowRuleStore;
 
 extern LARGE_INTEGER g_RegCookie;
 extern ULONG g_RuntimeStatusFlags;
 extern HIPS_PROTECTION_MODE g_ProtectionMode;
 extern ERESOURCE g_RuntimeStatusLock;
+extern ULONG g_PolicyEpoch;
 extern ULONGLONG g_ProcessVerdictRequestCount;
 extern ULONGLONG g_ProcessVerdictTimeoutCount;
 extern ULONGLONG g_ProcessPortConnectCount;
@@ -86,6 +93,11 @@ extern volatile LONG64 g_LastHeartbeatTime;
 extern volatile LONG64 g_ProcessBreakerOpenCount;
 extern volatile LONG64 g_LastProcessBreakerOpenTime;
 extern volatile LONG64 g_LastProcessBreakerCloseTime;
+extern volatile LONG64 g_FastPathHitCount;
+extern volatile LONG64 g_DecisionCacheHitCount;
+extern volatile LONG64 g_DecisionCacheMissCount;
+extern volatile LONG64 g_DecisionCacheFlushCount;
+extern volatile LONG64 g_SlowPathCount;
 extern ULONG g_ProcessVerdictTimeoutMs;
 extern ULONG g_ProcessVerdictFailMode;
 extern ULONG g_HeartbeatIntervalMs;

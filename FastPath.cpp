@@ -101,7 +101,8 @@ namespace {
         }
 
         identity->ProcessId = processId;
-        if (!QueryProcessCreateTimeCompat(process, &identity->CreateTime)) {
+        identity->CreateTime = (ULONGLONG)PsGetProcessCreateTimeQuadPart(process);
+        if (identity->CreateTime == 0) {
             return FALSE;
         }
 

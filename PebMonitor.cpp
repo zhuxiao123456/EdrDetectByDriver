@@ -25,6 +25,10 @@ ERESOURCE g_RegistryRuleLock = {};
 REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
 ULONG g_RegistryAllowRuleCount = 0;
 ERESOURCE g_RegistryAllowRuleLock = {};
+ERESOURCE g_RuleStoreStateLock = {};
+PRULE_STORE volatile g_RegistryBlockRuleStore = NULL;
+PRULE_STORE volatile g_RegistryAllowRuleStore = NULL;
+ULONG g_PolicyEpoch = 0;
 
 LARGE_INTEGER g_RegCookie = { 0 };
 ULONG g_RuntimeStatusFlags = 0;
@@ -234,6 +238,15 @@ NTSTATUS ProcessPortConnectNotify(
 
     g_ProcessClientPort = ClientPort;
     ReleaseExclusiveResourceLock(&g_ProcessPortLock);
+
+    if (!RegisterFastPathTrustedProcess(
+            clientProcessId,
+            PsGetCurrentProcess(),
+            FASTPATH_TRUST_FLAG_PROCESS_PORT_CLIENT)) {
+        KdPrint(("[PebMonitor] WARN: Failed to register connected process-port client for fast-path trust. PID=%lu\n",
+            clientProcessId));
+    }
+
     RecordProcessPortConnectEvent();
     return STATUS_SUCCESS;
 }
@@ -351,6 +364,7 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
     ResetRuntimeConfigInfo();
     ExDeleteResourceLite(&g_RuntimeStatusLock);
+    ExDeleteResourceLite(&g_RuleStoreStateLock);
     ExDeleteResourceLite(&g_RegistryAllowRuleLock);
     ExDeleteResourceLite(&g_RegistryRuleLock);
     ExDeleteResourceLite(&g_ProcessPortLock);
@@ -393,7 +407,11 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN processPortLockInitialized = FALSE;
     BOOLEAN registryRuleLockInitialized = FALSE;
     BOOLEAN registryAllowRuleLockInitialized = FALSE;
+    BOOLEAN ruleStoreStateLockInitialized = FALSE;
     BOOLEAN runtimeStatusLockInitialized = FALSE;
+    BOOLEAN ruleStoreInitialized = FALSE;
+    BOOLEAN decisionCacheInitialized = FALSE;
+    BOOLEAN fastPathInitialized = FALSE;
     PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     UNICODE_STRING processPortName = { 0 };
     OBJECT_ATTRIBUTES processPortAttributes = { 0 };
@@ -477,6 +495,30 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     KeInitializeTimerEx(&g_HeartbeatCheckTimer, NotificationTimer);
     KeInitializeDpc(&g_HeartbeatCheckDpc, HeartbeatCheckDpcRoutine, NULL);
     InitializeProtectionMode();
+
+    status = ExInitializeResourceLite(&g_RuleStoreStateLock);
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    ruleStoreStateLockInitialized = TRUE;
+
+    status = InitializeRuleStoreState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    ruleStoreInitialized = TRUE;
+
+    status = InitializeDecisionCacheState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    decisionCacheInitialized = TRUE;
+
+    status = InitializeFastPathState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    fastPathInitialized = TRUE;
 
     ExInitializeRundownProtection(&g_RundownRef);
 
@@ -609,8 +651,20 @@ Cleanup:
         ExDeleteNPagedLookasideList(&g_DriverEventLookaside);
     }
 
+    if (fastPathInitialized) {
+        CleanupFastPathState();
+    }
+    if (decisionCacheInitialized) {
+        CleanupDecisionCacheState();
+    }
+    if (ruleStoreInitialized) {
+        CleanupRuleStoreState();
+    }
     if (runtimeStatusLockInitialized) {
         ExDeleteResourceLite(&g_RuntimeStatusLock);
+    }
+    if (ruleStoreStateLockInitialized) {
+        ExDeleteResourceLite(&g_RuleStoreStateLock);
     }
     if (registryAllowRuleLockInitialized) {
         ExDeleteResourceLite(&g_RegistryAllowRuleLock);

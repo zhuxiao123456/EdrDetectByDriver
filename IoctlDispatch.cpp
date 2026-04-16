@@ -317,8 +317,10 @@ static NTSTATUS TerminateTargetProcessById(_In_ ULONG processId, _In_ LONG exitS
 static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) {
     RtlZeroMemory(runtimeStatus, sizeof(DRIVER_RUNTIME_STATUS));
 
+    runtimeStatus->AbiVersion = PEBMONITOR_ABI_VERSION;
     runtimeStatus->StatusFlags = ReadInterlockedFlags((volatile LONG*)&g_RuntimeStatusFlags);
     runtimeStatus->ProtectionMode = (ULONG)g_ProtectionMode;
+    runtimeStatus->PolicyEpoch = ReadInterlockedFlags((volatile LONG*)&g_PolicyEpoch);
     runtimeStatus->LastHeartbeatTime = ReadInterlockedCounter64(&g_LastHeartbeatTime);
     runtimeStatus->ProcessBreakerOpenCount = ReadInterlockedCounter64(&g_ProcessBreakerOpenCount);
     runtimeStatus->LastProcessBreakerOpenTime = ReadInterlockedCounter64(&g_LastProcessBreakerOpenTime);
