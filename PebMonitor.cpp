@@ -221,8 +221,9 @@ NTSTATUS ProcessPortConnectNotify(
     UNREFERENCED_PARAMETER(ConnectionContext);
     UNREFERENCED_PARAMETER(SizeOfContext);
 
+    ULONG clientProcessId = HandleToULong(PsGetCurrentProcessId());
     if (ConnectionCookie != NULL) {
-        *ConnectionCookie = NULL;
+        *ConnectionCookie = ULongToPtr(clientProcessId);
     }
 
     AcquireExclusiveResourceLock(&g_ProcessPortLock);
@@ -238,10 +239,9 @@ NTSTATUS ProcessPortConnectNotify(
 }
 
 VOID ProcessPortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
-    UNREFERENCED_PARAMETER(ConnectionCookie);
-
     PFLT_PORT clientPort = NULL;
     PFLT_FILTER filterHandle = NULL;
+    ULONG clientProcessId = HandleToULong(ConnectionCookie);
 
     AcquireExclusiveResourceLock(&g_ProcessPortLock);
     clientPort = g_ProcessClientPort;
@@ -251,6 +251,11 @@ VOID ProcessPortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
 
     if (filterHandle != NULL && clientPort != NULL) {
         FltCloseClientPort(filterHandle, &clientPort);
+    }
+
+    if (clientProcessId != 0) {
+        RemoveFastPathTrustedProcess(clientProcessId);
+        FlushDecisionCacheForProcess(clientProcessId);
     }
 
     RecordProcessPortDisconnectEvent();
@@ -319,6 +324,9 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
     SetRuntimeStatusFlag(DRIVER_STATUS_FLAG_PROCESS_CALLBACK_REGISTERED, FALSE);
 
     ExWaitForRundownProtectionRelease(&g_RundownRef);
+    CleanupRuleStoreState();
+    CleanupDecisionCacheState();
+    CleanupFastPathState();
 
     PIRP irpToCancel = (PIRP)InterlockedExchangePointer((PVOID*)&g_PendingDriverIrp, NULL);
     if (irpToCancel != NULL) {
@@ -462,6 +470,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     g_HeartbeatTimeoutMs = PROCESS_HEARTBEAT_TIMEOUT_MS_DEFAULT;
     g_CaptureParentCommandLine = PROCESS_PARENT_CMDLINE_CAPTURE_DISABLED;
     g_NextProcessEventId = 0;
+    g_PolicyEpoch = 0;
     RtlZeroMemory(g_ActiveConfigVersion, sizeof(g_ActiveConfigVersion));
     RtlZeroMemory(g_ActiveProfileName, sizeof(g_ActiveProfileName));
     RtlZeroMemory(g_ActiveGeneratedAt, sizeof(g_ActiveGeneratedAt));
