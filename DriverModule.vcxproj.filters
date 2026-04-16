@@ -22,6 +22,12 @@
     <ClCompile Include="ApiCompatibility.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="DecisionCache.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="FastPath.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="IoctlDispatch.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -40,6 +46,12 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ApiCompatibility.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="DecisionCache.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FastPath.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="OsVersionHelper.h">

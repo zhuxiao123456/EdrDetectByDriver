@@ -8,6 +8,7 @@ PFN_CM_CALLBACK_GET_KEY_OBJECT_ID_EX g_pCmCallbackGetKeyObjectIDEx = NULL;
 PFN_CM_CALLBACK_RELEASE_KEY_OBJECT_ID_EX g_pCmCallbackReleaseKeyObjectIDEx = NULL;
 PFN_PS_GET_PROCESS_PEB g_pPsGetProcessPeb = NULL;
 PFN_SE_LOCATE_PROCESS_IMAGE_NAME g_pSeLocateProcessImageName = NULL;
+PFN_PS_GET_PROCESS_CREATE_TIME_QUAD_PART g_pPsGetProcessCreateTimeQuadPart = NULL;
 
 static PVOID ResolveKernelRoutine(_In_z_ PCWSTR routineName) {
     UNICODE_STRING routine = {};
@@ -35,6 +36,8 @@ VOID InitializeApiCompatibility() {
         (PFN_PS_GET_PROCESS_PEB)ResolveKernelRoutine(L"PsGetProcessPeb");
     g_pSeLocateProcessImageName =
         (PFN_SE_LOCATE_PROCESS_IMAGE_NAME)ResolveKernelRoutine(L"SeLocateProcessImageName");
+    g_pPsGetProcessCreateTimeQuadPart =
+        (PFN_PS_GET_PROCESS_CREATE_TIME_QUAD_PART)ResolveKernelRoutine(L"PsGetProcessCreateTimeQuadPart");
 
     g_ApiSupport.HasExInitializeDriverRuntime = (g_pExInitializeDriverRuntime != NULL);
     g_ApiSupport.HasCmCallbackGetKeyObjectIDEx =
@@ -42,16 +45,18 @@ VOID InitializeApiCompatibility() {
     g_ApiSupport.HasCmCallbackReleaseKeyObjectIDEx = (g_pCmCallbackReleaseKeyObjectIDEx != NULL);
     g_ApiSupport.HasPsGetProcessPeb = (g_pPsGetProcessPeb != NULL);
     g_ApiSupport.HasSeLocateProcessImageName = (g_pSeLocateProcessImageName != NULL);
+    g_ApiSupport.HasPsGetProcessCreateTimeQuadPart = (g_pPsGetProcessCreateTimeQuadPart != NULL);
 
     KdPrint((
-        "[PebMonitor] INFO: ApiCompatibility initialized. OS=%lu.%lu build=%lu ExInitializeDriverRuntime=%s CmCallbackGetKeyObjectIDEx=%s PsGetProcessPeb=%s SeLocateProcessImageName=%s\n",
+        "[PebMonitor] INFO: ApiCompatibility initialized. OS=%lu.%lu build=%lu ExInitializeDriverRuntime=%s CmCallbackGetKeyObjectIDEx=%s PsGetProcessPeb=%s SeLocateProcessImageName=%s PsGetProcessCreateTimeQuadPart=%s\n",
         g_ApiSupport.OsMajorVersion,
         g_ApiSupport.OsMinorVersion,
         g_ApiSupport.OsBuildNumber,
         g_ApiSupport.HasExInitializeDriverRuntime ? "enabled" : "disabled",
         g_ApiSupport.HasCmCallbackGetKeyObjectIDEx ? "enabled" : "fallback",
         g_ApiSupport.HasPsGetProcessPeb ? "enabled" : "disabled",
-        g_ApiSupport.HasSeLocateProcessImageName ? "enabled" : "disabled"));
+        g_ApiSupport.HasSeLocateProcessImageName ? "enabled" : "disabled",
+        g_ApiSupport.HasPsGetProcessCreateTimeQuadPart ? "enabled" : "disabled"));
 }
 
 VOID TryInitializeDriverRuntimeCompat() {
@@ -126,4 +131,20 @@ NTSTATUS QueryProcessImageNameCompat(
     }
 
     return g_pSeLocateProcessImageName(process, imagePath);
+}
+
+BOOLEAN QueryProcessCreateTimeCompat(
+    _In_ PEPROCESS process,
+    _Out_ PULONGLONG createTime) {
+    if (createTime == NULL) {
+        return FALSE;
+    }
+
+    *createTime = 0;
+    if (process == NULL || g_pPsGetProcessCreateTimeQuadPart == NULL) {
+        return FALSE;
+    }
+
+    *createTime = (ULONGLONG)g_pPsGetProcessCreateTimeQuadPart(process);
+    return (*createTime != 0);
 }

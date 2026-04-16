@@ -218,8 +218,9 @@ NTSTATUS ProcessPortConnectNotify(
     UNREFERENCED_PARAMETER(ConnectionContext);
     UNREFERENCED_PARAMETER(SizeOfContext);
 
+    ULONG clientProcessId = HandleToULong(PsGetCurrentProcessId());
     if (ConnectionCookie != NULL) {
-        *ConnectionCookie = NULL;
+        *ConnectionCookie = ULongToPtr(clientProcessId);
     }
 
     AcquireExclusiveResourceLock(&g_ProcessPortLock);
@@ -230,15 +231,22 @@ NTSTATUS ProcessPortConnectNotify(
 
     g_ProcessClientPort = ClientPort;
     ReleaseExclusiveResourceLock(&g_ProcessPortLock);
+
+    if (!RegisterFastPathTrustedProcess(
+        clientProcessId,
+        PsGetCurrentProcess(),
+        FASTPATH_TRUST_FLAG_PROCESS_PORT_CLIENT)) {
+        KdPrint(("[PebMonitor] WARN: Failed to register trusted fast-path client process. PID=%lu\n", clientProcessId));
+    }
+
     RecordProcessPortConnectEvent();
     return STATUS_SUCCESS;
 }
 
 VOID ProcessPortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
-    UNREFERENCED_PARAMETER(ConnectionCookie);
-
     PFLT_PORT clientPort = NULL;
     PFLT_FILTER filterHandle = NULL;
+    ULONG clientProcessId = HandleToULong(ConnectionCookie);
 
     AcquireExclusiveResourceLock(&g_ProcessPortLock);
     clientPort = g_ProcessClientPort;
@@ -248,6 +256,11 @@ VOID ProcessPortDisconnectNotify(_In_opt_ PVOID ConnectionCookie) {
 
     if (filterHandle != NULL && clientPort != NULL) {
         FltCloseClientPort(filterHandle, &clientPort);
+    }
+
+    if (clientProcessId != 0) {
+        RemoveFastPathTrustedProcess(clientProcessId);
+        FlushDecisionCacheForProcess(clientProcessId);
     }
 
     RecordProcessPortDisconnectEvent();
@@ -317,6 +330,8 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
 
     ExWaitForRundownProtectionRelease(&g_RundownRef);
     CleanupRuleStoreState();
+    CleanupDecisionCacheState();
+    CleanupFastPathState();
 
     PIRP irpToCancel = (PIRP)InterlockedExchangePointer((PVOID*)&g_PendingDriverIrp, NULL);
     if (irpToCancel != NULL) {
@@ -381,6 +396,8 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN processCallbackRegistered = FALSE;
     BOOLEAN processPortLockInitialized = FALSE;
     BOOLEAN ruleStoreStateLockInitialized = FALSE;
+    BOOLEAN fastPathStateInitialized = FALSE;
+    BOOLEAN decisionCacheStateInitialized = FALSE;
     BOOLEAN runtimeStatusLockInitialized = FALSE;
     PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     UNICODE_STRING processPortName = { 0 };
@@ -426,6 +443,18 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     if (!NT_SUCCESS(status)) {
         goto Cleanup;
     }
+
+    status = InitializeFastPathState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    fastPathStateInitialized = TRUE;
+
+    status = InitializeDecisionCacheState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    decisionCacheStateInitialized = TRUE;
 
     status = ExInitializeResourceLite(&g_RuntimeStatusLock);
     if (!NT_SUCCESS(status)) {
@@ -594,6 +623,12 @@ Cleanup:
 
     if (runtimeStatusLockInitialized) {
         ExDeleteResourceLite(&g_RuntimeStatusLock);
+    }
+    if (decisionCacheStateInitialized) {
+        CleanupDecisionCacheState();
+    }
+    if (fastPathStateInitialized) {
+        CleanupFastPathState();
     }
     if (ruleStoreStateLockInitialized) {
         CleanupRuleStoreState();

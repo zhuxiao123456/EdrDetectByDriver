@@ -3,6 +3,8 @@
 #include <ntstrsafe.h>
 #include <ntimage.h>
 #include "ApiCompatibility.h"
+#include "FastPath.h"
+#include "DecisionCache.h"
 #include "RuleStore.h"
 #include "Shared.h"
 
@@ -65,6 +67,11 @@ extern PRULE_STORE g_RegistryBlockRuleStore;
 extern PRULE_STORE g_RegistryAllowRuleStore;
 extern ERESOURCE g_RuleStoreStateLock;
 extern volatile LONG g_PolicyEpoch;
+extern volatile LONG64 g_FastPathHitCount;
+extern volatile LONG64 g_DecisionCacheHitCount;
+extern volatile LONG64 g_DecisionCacheMissCount;
+extern volatile LONG64 g_DecisionCacheFlushCount;
+extern volatile LONG64 g_SlowPathCount;
 
 extern LARGE_INTEGER g_RegCookie;
 extern ULONG g_RuntimeStatusFlags;

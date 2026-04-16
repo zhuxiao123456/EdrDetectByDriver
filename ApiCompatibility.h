@@ -19,6 +19,9 @@ typedef NTSTATUS(NTAPI* PFN_SE_LOCATE_PROCESS_IMAGE_NAME)(
     _In_ PEPROCESS Process,
     _Outptr_ PUNICODE_STRING* ProcessImageName);
 
+typedef LONGLONG(NTAPI* PFN_PS_GET_PROCESS_CREATE_TIME_QUAD_PART)(
+    _In_ PEPROCESS Process);
+
 typedef VOID(NTAPI* PFN_EX_INITIALIZE_DRIVER_RUNTIME)(
     _In_ ULONG Flags);
 
@@ -31,6 +34,7 @@ typedef struct _PEBMONITOR_API_SUPPORT {
     BOOLEAN HasCmCallbackReleaseKeyObjectIDEx;
     BOOLEAN HasPsGetProcessPeb;
     BOOLEAN HasSeLocateProcessImageName;
+    BOOLEAN HasPsGetProcessCreateTimeQuadPart;
 } PEBMONITOR_API_SUPPORT, *PPEBMONITOR_API_SUPPORT;
 
 extern PEBMONITOR_API_SUPPORT g_ApiSupport;
@@ -39,6 +43,7 @@ extern PFN_CM_CALLBACK_GET_KEY_OBJECT_ID_EX g_pCmCallbackGetKeyObjectIDEx;
 extern PFN_CM_CALLBACK_RELEASE_KEY_OBJECT_ID_EX g_pCmCallbackReleaseKeyObjectIDEx;
 extern PFN_PS_GET_PROCESS_PEB g_pPsGetProcessPeb;
 extern PFN_SE_LOCATE_PROCESS_IMAGE_NAME g_pSeLocateProcessImageName;
+extern PFN_PS_GET_PROCESS_CREATE_TIME_QUAD_PART g_pPsGetProcessCreateTimeQuadPart;
 
 VOID InitializeApiCompatibility();
 VOID TryInitializeDriverRuntimeCompat();
@@ -54,3 +59,6 @@ PVOID QueryProcessPebCompat(_In_ PEPROCESS process);
 NTSTATUS QueryProcessImageNameCompat(
     _In_ PEPROCESS process,
     _Outptr_ PUNICODE_STRING* imagePath);
+BOOLEAN QueryProcessCreateTimeCompat(
+    _In_ PEPROCESS process,
+    _Out_ PULONGLONG createTime);

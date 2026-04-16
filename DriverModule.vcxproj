@@ -142,6 +142,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ApiCompatibility.cpp" />
+    <ClCompile Include="DecisionCache.cpp" />
+    <ClCompile Include="FastPath.cpp" />
     <ClCompile Include="IoctlDispatch.cpp" />
     <ClCompile Include="MonitorCallbacks.cpp" />
     <ClCompile Include="OsVersionHelper.cpp" />
@@ -150,6 +152,8 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ApiCompatibility.h" />
+    <ClInclude Include="DecisionCache.h" />
+    <ClInclude Include="FastPath.h" />
     <ClInclude Include="OsVersionHelper.h" />
     <ClInclude Include="PebMonitor.h" />
     <ClInclude Include="RuleStore.h" />

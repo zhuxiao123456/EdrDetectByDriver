@@ -360,11 +360,11 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
 
     runtimeStatus->DriverEventDropCount = ReadInterlockedCounter64(&g_DriverEventDropCount);
     runtimeStatus->DriverEventAllocFailCount = ReadInterlockedCounter64(&g_DriverEventAllocFailCount);
-    runtimeStatus->FastPathHitCount = 0;
-    runtimeStatus->CacheHitCount = 0;
-    runtimeStatus->CacheMissCount = 0;
-    runtimeStatus->CacheFlushCount = 0;
-    runtimeStatus->SlowPathCount = runtimeStatus->ProcessVerdictRequestCount;
+    runtimeStatus->FastPathHitCount = ReadInterlockedCounter64(&g_FastPathHitCount);
+    runtimeStatus->CacheHitCount = ReadInterlockedCounter64(&g_DecisionCacheHitCount);
+    runtimeStatus->CacheMissCount = ReadInterlockedCounter64(&g_DecisionCacheMissCount);
+    runtimeStatus->CacheFlushCount = ReadInterlockedCounter64(&g_DecisionCacheFlushCount);
+    runtimeStatus->SlowPathCount = ReadInterlockedCounter64(&g_SlowPathCount);
 }
 
 VOID CancelPendingDriverIrp(PDEVICE_OBJECT DeviceObject, PIRP Irp) {

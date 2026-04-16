@@ -1412,31 +1412,36 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         return;
     }
 
+    ULONG processIdValue = HandleToULong(ProcessId);
     if (CreateInfo == NULL) {
+        RemoveFastPathTrustedProcess(processIdValue);
+        FlushDecisionCacheForProcess(processIdValue);
         ExReleaseRundownProtection(&g_RundownRef);
         return;
     }
 
     const HANDLE parentProcessId = CreateInfo->ParentProcessId;
+    PROCESS_IDENTITY parentIdentity = {};
+    BOOLEAN parentIdentityAvailable = CaptureProcessIdentityByProcessId(parentProcessId, &parentIdentity);
+    WCHAR resolvedImagePath[MAX_REG_PATH_LENGTH] = {};
+    UNICODE_STRING capturedResolvedImagePath = {};
+
+    if (!CaptureUnicodeStringToLocalBuffer(
+        CreateInfo->ImageFileName,
+        resolvedImagePath,
+        RTL_NUMBER_OF(resolvedImagePath),
+        &capturedResolvedImagePath)) {
+        CaptureProcessImagePath(Process, resolvedImagePath, RTL_NUMBER_OF(resolvedImagePath));
+    }
 
     if (g_ProtectionMode == HIPS_MODE_MONITOR_ONLY) {
-        WCHAR observedImagePath[MAX_REG_PATH_LENGTH] = {};
         WCHAR observedProcessName[MAX_RULE_LENGTH] = {};
         WCHAR observedCommandLine[MAX_EVENT_COMMAND_LINE_LENGTH] = {};
-        UNICODE_STRING capturedObservedImagePath = {};
         UNICODE_STRING capturedObservedCommandLine = {};
 
-        if (!CaptureUnicodeStringToLocalBuffer(
-            CreateInfo->ImageFileName,
-            observedImagePath,
-            RTL_NUMBER_OF(observedImagePath),
-            &capturedObservedImagePath)) {
-            CaptureProcessImagePath(Process, observedImagePath, RTL_NUMBER_OF(observedImagePath));
-        }
-
-        if (observedImagePath[0] != L'\0') {
+        if (resolvedImagePath[0] != L'\0') {
             ExtractProcessNameFromPathBuffer(
-                observedImagePath,
+                resolvedImagePath,
                 observedProcessName,
                 RTL_NUMBER_OF(observedProcessName));
         }
@@ -1453,9 +1458,24 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         QueueProcessObservedEvent(
             ProcessId,
             parentProcessId,
-            observedImagePath,
+            resolvedImagePath,
             observedProcessName,
             observedCommandLine);
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    if (EvaluateFastPathProcessCreateAllow(parentIdentityAvailable ? &parentIdentity : NULL)) {
+        ExReleaseRundownProtection(&g_RundownRef);
+        return;
+    }
+
+    DECISION_CACHE_KEY decisionCacheKey = {};
+    BOOLEAN cacheKeyAvailable = BuildProcessCreateDecisionCacheKey(
+        parentIdentityAvailable ? &parentIdentity : NULL,
+        resolvedImagePath,
+        &decisionCacheKey);
+    if (cacheKeyAvailable && TryGetDecisionCacheAllow(&decisionCacheKey)) {
         ExReleaseRundownProtection(&g_RundownRef);
         return;
     }
@@ -1505,15 +1525,17 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     LARGE_INTEGER createTime;
     KeQuerySystemTime(&createTime);
     request.CreateTime = (ULONGLONG)createTime.QuadPart;
-    request.ProcessId = HandleToULong(ProcessId);
+    request.ProcessId = processIdValue;
     request.ParentProcessId = HandleToULong(parentProcessId);
 
-    UNICODE_STRING capturedImagePath = {};
-    if (!CaptureUnicodeStringToLocalBuffer(
-        CreateInfo->ImageFileName,
-        request.ImagePath,
-        RTL_NUMBER_OF(request.ImagePath),
-        &capturedImagePath)) {
+    if (resolvedImagePath[0] != L'\0') {
+        CopyWideStringToFixedBuffer(
+            request.ImagePath,
+            RTL_NUMBER_OF(request.ImagePath),
+            resolvedImagePath);
+    }
+
+    if (request.ImagePath[0] == L'\0') {
         CaptureProcessImagePath(Process, request.ImagePath, RTL_NUMBER_OF(request.ImagePath));
     }
 
@@ -1548,6 +1570,7 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         request.ParentCommandLine[0] = L'\0';
     }
 
+    RecordSlowPathProcessVerdict();
     RecordProcessVerdictRequestEvent();
 
     PROCESS_PORT_REPLY reply = {};
@@ -1555,6 +1578,7 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
     ULONG timeoutMs = 0;
     LARGE_INTEGER timeout = ProcessVerdictWaitTimeout(&timeoutMs);
     NTSTATUS sendStatus = STATUS_PORT_DISCONNECTED;
+    BOOLEAN slowPathAllow = FALSE;
     sendStatus = FltSendMessage(
         filterHandle,
         &clientPort,
@@ -1569,6 +1593,11 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         reply.Version == PROCESS_PORT_PROTOCOL_VERSION &&
         reply.BlockProcess != 0) {
         blockProcess = TRUE;
+    }
+    else if (NT_SUCCESS(sendStatus) &&
+        replyLength >= sizeof(PROCESS_PORT_REPLY) &&
+        reply.Version == PROCESS_PORT_PROTOCOL_VERSION) {
+        slowPathAllow = TRUE;
     }
     else if (!NT_SUCCESS(sendStatus) || replyLength < sizeof(PROCESS_PORT_REPLY) ||
         reply.Version != PROCESS_PORT_PROTOCOL_VERSION) {
@@ -1591,6 +1620,10 @@ void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _
         if (failMode == PROCESS_VERDICT_FAIL_CLOSE) {
             blockProcess = TRUE;
         }
+    }
+
+    if (slowPathAllow && cacheKeyAvailable) {
+        RememberAllowedProcessCreateDecision(&decisionCacheKey);
     }
 
     if (blockProcess) {

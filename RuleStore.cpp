@@ -327,6 +327,7 @@ NTSTATUS ApplyRegistryRuleUpdate(
     PREGISTRY_RULE flatRules = NULL;
     ULONG oldCount = 0;
     ULONG combinedRuleCount = 0;
+    BOOLEAN storeUpdated = FALSE;
 
     AcquireExclusiveResourceLock(&g_RuleStoreStateLock);
 
@@ -359,6 +360,7 @@ NTSTATUS ApplyRegistryRuleUpdate(
     oldStore = (PRULE_STORE)InterlockedExchangePointer((PVOID*)targetStore, newStore);
     newStore = NULL;
     InterlockedIncrement((volatile LONG*)&g_PolicyEpoch);
+    storeUpdated = TRUE;
 
     if (newRuleCount != NULL) {
         *newRuleCount = combinedRuleCount;
@@ -369,6 +371,10 @@ Cleanup:
 
     FreeRuleArray(flatRules);
     FreeRuleStore(newStore);
+
+    if (NT_SUCCESS(status) && storeUpdated) {
+        FlushDecisionCache();
+    }
 
     if (NT_SUCCESS(status) && oldStore != NULL) {
         WaitForRuleStoreReferencesToDrain(oldStore);
