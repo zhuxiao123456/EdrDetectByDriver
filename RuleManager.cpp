@@ -532,33 +532,87 @@ namespace {
         return false;
     }
 
-    void AppendRegistryFieldValue(RegistryRuleField& field, const std::string& rawValue) {
-        std::wstring value = TrimWhitespace(Utf8ToWStringLocal(rawValue));
+    void AppendRegistryFieldValue(std::vector<std::wstring>& values, const std::wstring& value) {
         if (value.empty()) {
             return;
         }
 
-        if (std::find(field.values.begin(), field.values.end(), value) == field.values.end()) {
-            field.values.push_back(value);
+        if (std::find(values.begin(), values.end(), value) == values.end()) {
+            values.push_back(value);
         }
     }
 
-    bool ParseRegistryFieldValues(const json& node, RegistryRuleField& outField) {
+    bool ParseRegistryFieldValues(const json& node, std::vector<std::wstring>& outValues) {
         if (node.is_string()) {
-            AppendRegistryFieldValue(outField, node.get<std::string>());
+            AppendRegistryFieldValue(outValues, TrimWhitespace(Utf8ToWStringLocal(node.get<std::string>())));
             return true;
         }
 
         if (node.is_array()) {
             for (json::const_iterator it = node.begin(); it != node.end(); ++it) {
                 if (it->is_string()) {
-                    AppendRegistryFieldValue(outField, it->get<std::string>());
+                    AppendRegistryFieldValue(outValues, TrimWhitespace(Utf8ToWStringLocal(it->get<std::string>())));
                 }
             }
             return true;
         }
 
         return false;
+    }
+
+    bool ClassifyRegistryRuleValueMatchType(
+        const std::wstring& rawValue,
+        ULONG fallbackMatchType,
+        bool hasExplicitMatchType,
+        ULONG& outMatchType,
+        std::wstring& outNormalizedValue) {
+        std::wstring value = TrimWhitespace(rawValue);
+        if (value.empty()) {
+            return false;
+        }
+
+        if (hasExplicitMatchType) {
+            outMatchType = fallbackMatchType;
+            outNormalizedValue = value;
+            return true;
+        }
+
+        const bool startsWithWildcard = !value.empty() && value.front() == L'*';
+        const bool endsWithWildcard = !value.empty() && value.back() == L'*';
+
+        if (!startsWithWildcard && !endsWithWildcard) {
+            outMatchType = fallbackMatchType;
+            outNormalizedValue = value;
+            return true;
+        }
+
+        if (startsWithWildcard && endsWithWildcard) {
+            if (value.size() <= 2) {
+                return false;
+            }
+
+            outMatchType = REGISTRY_MATCH_TYPE_CONTAINS;
+            outNormalizedValue = value.substr(1, value.size() - 2);
+        }
+        else if (startsWithWildcard) {
+            if (value.size() <= 1) {
+                return false;
+            }
+
+            outMatchType = REGISTRY_MATCH_TYPE_SUFFIX;
+            outNormalizedValue = value.substr(1);
+        }
+        else {
+            if (value.size() <= 1) {
+                return false;
+            }
+
+            outMatchType = REGISTRY_MATCH_TYPE_PREFIX;
+            outNormalizedValue = value.substr(0, value.size() - 1);
+        }
+
+        outNormalizedValue = TrimWhitespace(outNormalizedValue);
+        return !outNormalizedValue.empty();
     }
 
     bool ParseRegistryField(
@@ -572,6 +626,8 @@ namespace {
 
         outField.enabled = true;
         outField.matchType = defaultMatchType;
+        bool hasExplicitMatchType = false;
+        std::vector<std::wstring> rawValues;
 
         const json& node = root[fieldName];
         if (node.is_object()) {
@@ -580,15 +636,16 @@ namespace {
                     !TryParseRegistryMatchType(node["match_type"].get<std::string>(), outField.matchType)) {
                     return false;
                 }
+                hasExplicitMatchType = true;
             }
 
             if (node.contains("values")) {
-                if (!ParseRegistryFieldValues(node["values"], outField)) {
+                if (!ParseRegistryFieldValues(node["values"], rawValues)) {
                     return false;
                 }
             }
             else if (node.contains("value")) {
-                if (!ParseRegistryFieldValues(node["value"], outField)) {
+                if (!ParseRegistryFieldValues(node["value"], rawValues)) {
                     return false;
                 }
             }
@@ -596,15 +653,117 @@ namespace {
                 return false;
             }
         }
-        else if (!ParseRegistryFieldValues(node, outField)) {
+        else if (!ParseRegistryFieldValues(node, rawValues)) {
             return false;
         }
 
+        ULONG classifiedMatchType = outField.matchType;
+        for (std::vector<std::wstring>::const_iterator it = rawValues.begin(); it != rawValues.end(); ++it) {
+            ULONG valueMatchType = outField.matchType;
+            std::wstring normalizedValue;
+            if (!ClassifyRegistryRuleValueMatchType(
+                *it,
+                outField.matchType,
+                hasExplicitMatchType,
+                valueMatchType,
+                normalizedValue)) {
+                return false;
+            }
+
+            if (!hasExplicitMatchType) {
+                if (outField.values.empty()) {
+                    classifiedMatchType = valueMatchType;
+                }
+                else if (classifiedMatchType != valueMatchType) {
+                    std::wcerr << L"[RuleManager] Skip registry field " << Utf8ToWStringLocal(fieldName)
+                        << L": mixed wildcard match types require explicit match_type." << std::endl;
+                    return false;
+                }
+            }
+
+            AppendRegistryFieldValue(outField.values, normalizedValue);
+        }
+
+        outField.matchType = classifiedMatchType;
         if (!IsValidRegistryMatchType(outField.matchType) || outField.values.empty()) {
             return false;
         }
 
         return true;
+    }
+
+    ULONG PromoteCompiledRuleBucket(ULONG currentBucket, ULONG matchType) {
+        switch (matchType) {
+        case REGISTRY_MATCH_TYPE_EXACT:
+        case REGISTRY_MATCH_TYPE_PREFIX:
+        case REGISTRY_MATCH_TYPE_SUFFIX:
+        case REGISTRY_MATCH_TYPE_CONTAINS:
+            return (matchType > currentBucket) ? matchType : currentBucket;
+        default:
+            return 0;
+        }
+    }
+
+    bool CountCompiledRulesByMatchType(
+        const std::vector<REGISTRY_RULE>& compiledRules,
+        RegistryRuleClassStats& outStats) {
+        outStats = RegistryRuleClassStats{};
+
+        for (std::vector<REGISTRY_RULE>::const_iterator it = compiledRules.begin();
+            it != compiledRules.end();
+            ++it) {
+            ULONG bucket = REGISTRY_MATCH_TYPE_EXACT;
+
+            if ((it->MatchFlags & REGISTRY_MATCH_FLAG_PROCESS_NAME) != 0) {
+                bucket = PromoteCompiledRuleBucket(bucket, it->ProcessNameMatchType);
+            }
+            if ((it->MatchFlags & REGISTRY_MATCH_FLAG_KEY_PATH) != 0) {
+                bucket = PromoteCompiledRuleBucket(bucket, it->KeyPathMatchType);
+            }
+            if ((it->MatchFlags & REGISTRY_MATCH_FLAG_INFO_CLASS) != 0) {
+                bucket = PromoteCompiledRuleBucket(bucket, it->InfoClassMatchType);
+            }
+            if ((it->MatchFlags & REGISTRY_MATCH_FLAG_VALUE_NAME) != 0) {
+                bucket = PromoteCompiledRuleBucket(bucket, it->ValueNameMatchType);
+            }
+            if ((it->MatchFlags & REGISTRY_MATCH_FLAG_VALUE_DATA) != 0) {
+                bucket = PromoteCompiledRuleBucket(bucket, it->ValueDataMatchType);
+            }
+
+            if (!IsValidRegistryMatchType(bucket)) {
+                return false;
+            }
+
+            ++outStats.totalRules;
+            switch (bucket) {
+            case REGISTRY_MATCH_TYPE_EXACT:
+                ++outStats.exactRules;
+                break;
+            case REGISTRY_MATCH_TYPE_PREFIX:
+                ++outStats.prefixRules;
+                break;
+            case REGISTRY_MATCH_TYPE_SUFFIX:
+                ++outStats.suffixRules;
+                break;
+            case REGISTRY_MATCH_TYPE_CONTAINS:
+                ++outStats.containsRules;
+                break;
+            default:
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void MergeRegistryRuleClassStats(
+        RegistryRuleClassStats& target,
+        const RegistryRuleClassStats& delta) {
+        target.totalRules += delta.totalRules;
+        target.exactRules += delta.exactRules;
+        target.prefixRules += delta.prefixRules;
+        target.suffixRules += delta.suffixRules;
+        target.containsRules += delta.containsRules;
     }
 
     bool ParseRegistryOperation(const json& root, ULONG& outOperation) {
@@ -810,14 +969,16 @@ namespace {
         return ExpandSingleRegistryRule(outDefinition, outCompiledRules);
     }
 
-        bool ParseRegistryRuleArray(
+    bool ParseRegistryRuleArray(
         const json& ruleArray,
         std::vector<RegistryRuleDefinition>& outDefinitions,
-        std::vector<REGISTRY_RULE>& outCompiledRules) {
+        std::vector<REGISTRY_RULE>& outCompiledRules,
+        RegistryRuleClassStats& outStats) {
         if (!ruleArray.is_array()) {
             return false;
         }
 
+        RegistryRuleClassStats aggregateStats;
         for (json::const_iterator item = ruleArray.begin(); item != ruleArray.end(); ++item) {
             RegistryRuleDefinition definition;
             std::vector<REGISTRY_RULE> compiledRules;
@@ -825,16 +986,24 @@ namespace {
                 continue;
             }
 
-            if (outCompiledRules.size() + compiledRules.size() > MAX_REGISTRY_RULE_COUNT) {
-                std::wcerr << L"[RuleManager] registry_rules exceed kernel capacity ("
-                    << MAX_REGISTRY_RULE_COUNT << L")." << std::endl;
+            RegistryRuleClassStats compiledStats;
+            if (!CountCompiledRulesByMatchType(compiledRules, compiledStats)) {
+                std::wcerr << L"[RuleManager] Skip registry rule " << definition.id
+                    << L": unsupported compiled match type." << std::endl;
+                return false;
+            }
+            if (aggregateStats.containsRules + compiledStats.containsRules > MAX_REGISTRY_CONTAINS_RULES) {
+                std::wcerr << L"[RuleManager] contains match count exceeds limit ("
+                    << MAX_REGISTRY_CONTAINS_RULES << L")." << std::endl;
                 return false;
             }
 
             outDefinitions.push_back(definition);
             outCompiledRules.insert(outCompiledRules.end(), compiledRules.begin(), compiledRules.end());
+            MergeRegistryRuleClassStats(aggregateStats, compiledStats);
         }
 
+        outStats = aggregateStats;
         return true;
     }
 
@@ -1001,7 +1170,8 @@ bool RuleManager::TryLoadRulesFromJson(
                 if (!ParseRegistryRuleArray(
                     root["registry_rules"],
                     loadedConfig.registryRuleDefinitions,
-                    loadedConfig.registryRules)) {
+                    loadedConfig.registryRules,
+                    loadedConfig.registryRuleClassStats)) {
                     if (outError != nullptr) {
                         *outError = L"invalid registry_rules";
                     }
@@ -1013,7 +1183,8 @@ bool RuleManager::TryLoadRulesFromJson(
                 if (!ParseRegistryRuleArray(
                     root["registry_allow_rules"],
                     loadedConfig.registryAllowRuleDefinitions,
-                    loadedConfig.registryAllowRules)) {
+                    loadedConfig.registryAllowRules,
+                    loadedConfig.registryAllowRuleClassStats)) {
                     if (outError != nullptr) {
                         *outError = L"invalid registry_allow_rules";
                     }

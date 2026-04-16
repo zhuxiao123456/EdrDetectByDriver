@@ -871,6 +871,16 @@ bool QueryDriverStatus(HANDLE hDevice, DRIVER_RUNTIME_STATUS& outStatus) {
         return false;
     }
 
+    if (!PEBMONITOR_ABI_IS_COMPAT(outStatus.AbiVersion)) {
+        std::wcerr << L"[-] 错误：驱动状态 ABI 版本不兼容 (driver="
+                   << outStatus.AbiVersion
+                   << L", expected=" << PEBMONITOR_ABI_VERSION << L")"
+                   << std::endl;
+        ZeroMemory(&outStatus, sizeof(outStatus));
+        SetLastError(ERROR_REVISION_MISMATCH);
+        return false;
+    }
+
     return true;
 }
 
