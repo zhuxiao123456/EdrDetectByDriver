@@ -3,6 +3,7 @@
 #include "OsVersionHelper.h"
 
 PEBMONITOR_API_SUPPORT g_ApiSupport = {};
+PFN_EX_INITIALIZE_DRIVER_RUNTIME g_pExInitializeDriverRuntime = NULL;
 PFN_CM_CALLBACK_GET_KEY_OBJECT_ID_EX g_pCmCallbackGetKeyObjectIDEx = NULL;
 PFN_CM_CALLBACK_RELEASE_KEY_OBJECT_ID_EX g_pCmCallbackReleaseKeyObjectIDEx = NULL;
 PFN_PS_GET_PROCESS_PEB g_pPsGetProcessPeb = NULL;
@@ -24,6 +25,8 @@ VOID InitializeApiCompatibility() {
         g_ApiSupport.OsBuildNumber = versionInfo.BuildNumber;
     }
 
+    g_pExInitializeDriverRuntime =
+        (PFN_EX_INITIALIZE_DRIVER_RUNTIME)ResolveKernelRoutine(L"ExInitializeDriverRuntime");
     g_pCmCallbackGetKeyObjectIDEx =
         (PFN_CM_CALLBACK_GET_KEY_OBJECT_ID_EX)ResolveKernelRoutine(L"CmCallbackGetKeyObjectIDEx");
     g_pCmCallbackReleaseKeyObjectIDEx =
@@ -33,6 +36,7 @@ VOID InitializeApiCompatibility() {
     g_pSeLocateProcessImageName =
         (PFN_SE_LOCATE_PROCESS_IMAGE_NAME)ResolveKernelRoutine(L"SeLocateProcessImageName");
 
+    g_ApiSupport.HasExInitializeDriverRuntime = (g_pExInitializeDriverRuntime != NULL);
     g_ApiSupport.HasCmCallbackGetKeyObjectIDEx =
         (g_pCmCallbackGetKeyObjectIDEx != NULL && g_pCmCallbackReleaseKeyObjectIDEx != NULL);
     g_ApiSupport.HasCmCallbackReleaseKeyObjectIDEx = (g_pCmCallbackReleaseKeyObjectIDEx != NULL);
@@ -40,13 +44,28 @@ VOID InitializeApiCompatibility() {
     g_ApiSupport.HasSeLocateProcessImageName = (g_pSeLocateProcessImageName != NULL);
 
     KdPrint((
-        "[PebMonitor] INFO: ApiCompatibility initialized. OS=%lu.%lu build=%lu CmCallbackGetKeyObjectIDEx=%s PsGetProcessPeb=%s SeLocateProcessImageName=%s\n",
+        "[PebMonitor] INFO: ApiCompatibility initialized. OS=%lu.%lu build=%lu ExInitializeDriverRuntime=%s CmCallbackGetKeyObjectIDEx=%s PsGetProcessPeb=%s SeLocateProcessImageName=%s\n",
         g_ApiSupport.OsMajorVersion,
         g_ApiSupport.OsMinorVersion,
         g_ApiSupport.OsBuildNumber,
+        g_ApiSupport.HasExInitializeDriverRuntime ? "enabled" : "disabled",
         g_ApiSupport.HasCmCallbackGetKeyObjectIDEx ? "enabled" : "fallback",
         g_ApiSupport.HasPsGetProcessPeb ? "enabled" : "disabled",
         g_ApiSupport.HasSeLocateProcessImageName ? "enabled" : "disabled"));
+}
+
+VOID TryInitializeDriverRuntimeCompat() {
+    if (g_pExInitializeDriverRuntime == NULL) {
+        KdPrint((
+            "[PebMonitor] INFO: ExInitializeDriverRuntime unavailable on OS=%lu.%lu build=%lu; skipping NX opt-in.\n",
+            g_ApiSupport.OsMajorVersion,
+            g_ApiSupport.OsMinorVersion,
+            g_ApiSupport.OsBuildNumber));
+        return;
+    }
+
+    g_pExInitializeDriverRuntime(DrvRtPoolNxOptIn);
+    KdPrint(("[PebMonitor] INFO: ExInitializeDriverRuntime enabled with DrvRtPoolNxOptIn.\n"));
 }
 
 NTSTATUS QueryRegistryObjectNameCompat(

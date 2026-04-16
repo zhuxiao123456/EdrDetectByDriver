@@ -393,8 +393,8 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     LARGE_INTEGER heartbeatDueTime = {};
     UNICODE_STRING devName = RTL_CONSTANT_STRING(L"\\Device\\PebMonitor");
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\DosDevices\\PebMonitor");
-    ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
     InitializeApiCompatibility();
+    TryInitializeDriverRuntimeCompat();
 
     InitializeListHead(&g_DriverEventQueue);
     KeInitializeSpinLock(&g_DriverQueueLock);
