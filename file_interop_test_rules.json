@@ -1,0 +1,44 @@
+{
+  "config_version": "test-file-interop-2026.04.07",
+  "profile_name": "file_interop_test",
+  "generated_at": "2026-04-07T17:20:00.000+08:00",
+  "process_rules": [],
+  "process_allow_rules": [],
+  "driver_blacklist": [],
+  "file_rules": [
+    {
+      "id": "file-test-block-powershell-sys-drop",
+      "threat_desc": "block powershell dropping kernel driver file",
+      "severity": 10,
+      "operation": "create_or_write",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["powershell.exe"]
+      },
+      "file_extension": {
+        "match_type": "exact",
+        "values": [".sys"]
+      }
+    },
+    {
+      "id": "file-test-block-temp-payload-drop",
+      "threat_desc": "block cmd or powershell dropping executable payload into temp interop directory",
+      "severity": 9,
+      "operation": "create_or_write",
+      "process_name": {
+        "match_type": "exact",
+        "values": ["cmd.exe", "powershell.exe"]
+      },
+      "target_path": {
+        "match_type": "contains",
+        "values": ["\\temp\\hostguardinterop\\"]
+      },
+      "file_extension": {
+        "match_type": "exact",
+        "values": [".exe", ".dll", ".sys"]
+      }
+    }
+  ],
+  "registry_rules": [],
+  "registry_allow_rules": []
+}

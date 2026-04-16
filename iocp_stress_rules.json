@@ -1,0 +1,103 @@
+{
+  "config_version": "iocp-stress-v1-2026-04-09",
+  "profile_name": "iocp_interop_stress",
+  "generated_at": "2026-04-09T17:30:00+08:00",
+  "process_rules": [
+    {
+      "id": "proc-stress-block-token",
+      "threat_desc": "block stress token process command line",
+      "severity": 7,
+      "rule": {
+        "matchArray": [
+          {
+            "position": 2,
+            "value": [
+              "^powershell\\.exe$"
+            ]
+          },
+          {
+            "position": 3,
+            "value": [
+              "HGSTRESS_BLOCK_[0-9]+"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "process_allow_rules": [],
+  "driver_blacklist": [],
+  "file_rules": [
+    {
+      "id": "file-stress-block-sys-drop",
+      "threat_desc": "block powershell dropping sys files under stress path",
+      "severity": 9,
+      "operation": "create_or_write",
+      "process_name": {
+        "match_type": "exact",
+        "values": [
+          "powershell.exe"
+        ]
+      },
+      "target_path": {
+        "match_type": "contains",
+        "values": [
+          "\\hostguardiocpstress\\"
+        ]
+      },
+      "file_extension": {
+        "match_type": "exact",
+        "values": [
+          ".sys",
+          ".dll",
+          ".exe"
+        ]
+      }
+    }
+  ],
+  "registry_rules": [
+    {
+      "id": "reg-stress-set-value",
+      "threat_desc": "block stress registry set value",
+      "severity": 8,
+      "operation": "set_value",
+      "process_name": {
+        "match_type": "exact",
+        "values": [
+          "powershell.exe"
+        ]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": [
+          "\\software\\hostguardiocpstress\\setvaluetarget"
+        ]
+      },
+      "value_name": {
+        "match_type": "exact",
+        "values": [
+          "DangerValue"
+        ]
+      }
+    },
+    {
+      "id": "reg-stress-create-key",
+      "threat_desc": "block stress registry create key",
+      "severity": 8,
+      "operation": "create_key",
+      "process_name": {
+        "match_type": "exact",
+        "values": [
+          "powershell.exe"
+        ]
+      },
+      "key_path": {
+        "match_type": "contains",
+        "values": [
+          "\\software\\hostguardiocpstress\\createkeyblocked"
+        ]
+      }
+    }
+  ],
+  "registry_allow_rules": []
+}
