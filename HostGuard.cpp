@@ -326,7 +326,7 @@ namespace {
             previousConfig.sourcePath != newConfig.sourcePath;
     }
 
-        void AppendPrefixedConfigFields(
+    void AppendPrefixedConfigFields(
         json& event,
         const RuleConfiguration& config,
         const char* prefix) {
@@ -356,7 +356,32 @@ namespace {
         event[keyPrefix + "auto_terminate_cooldown_ms"] =
             config.autoResponse.cooldownMs;
     }
-        void LogConfigSummary(const RuleConfiguration& config) {
+
+    void AppendRegistryRuleClassStatsFields(
+        json& event,
+        const RegistryRuleClassStats& stats,
+        const char* prefix) {
+        const std::string keyPrefix = (prefix != nullptr) ? prefix : "";
+        event[keyPrefix + "total"] = stats.totalRules;
+        event[keyPrefix + "exact"] = stats.exactRules;
+        event[keyPrefix + "prefix"] = stats.prefixRules;
+        event[keyPrefix + "suffix"] = stats.suffixRules;
+        event[keyPrefix + "contains"] = stats.containsRules;
+    }
+
+    void LogRegistryRuleClassStats(
+        const std::wstring& label,
+        const RegistryRuleClassStats& stats) {
+        LogMessage(
+            label +
+            L": total=" + std::to_wstring(stats.totalRules) +
+            L", exact=" + std::to_wstring(stats.exactRules) +
+            L", prefix=" + std::to_wstring(stats.prefixRules) +
+            L", suffix=" + std::to_wstring(stats.suffixRules) +
+            L", contains=" + std::to_wstring(stats.containsRules));
+    }
+
+    void LogConfigSummary(const RuleConfiguration& config) {
         std::wstring prefix = L"[+] 当前配置已生效";
         if (!config.profileName.empty() || !config.configVersion.empty()) {
             prefix += L" (Profile=" +
@@ -379,11 +404,14 @@ namespace {
             L"ms, 超时策略 " + ProcessVerdictFailModeToString(config.processVerdictFailMode) +
             L", 父命令行捕获 " +
             std::wstring((config.captureParentCommandLine == PROCESS_PARENT_CMDLINE_CAPTURE_ENABLED) ? L"enabled" : L"disabled") +
-            L", 自动终止[registry=" +
-            std::wstring(config.autoResponse.terminateOnRegistryBlock ? L"on" : L"off") +
-            L", min_severity=" + std::to_wstring(config.autoResponse.minSeverity) +
-            L", cooldown=" + std::to_wstring(config.autoResponse.cooldownMs) + L"ms]。"
-        );
+             L", 自动终止[registry=" +
+             std::wstring(config.autoResponse.terminateOnRegistryBlock ? L"on" : L"off") +
+             L", min_severity=" + std::to_wstring(config.autoResponse.minSeverity) +
+             L", cooldown=" + std::to_wstring(config.autoResponse.cooldownMs) + L"ms]。"
+         );
+
+        LogRegistryRuleClassStats(L"[*] 注册表规则分类[block]", config.registryRuleClassStats);
+        LogRegistryRuleClassStats(L"[*] 注册表规则分类[allow]", config.registryAllowRuleClassStats);
     }
     std::wstring FormatDriverSystemTimeValue(ULONGLONG rawTime) {
         if (rawTime == 0) {
@@ -1073,6 +1101,9 @@ static bool ApplyRegistryRules(HANDLE hDevice, const RuleConfiguration& config) 
         LogMessage(L"[!] 警告：清空驱动注册表白名单失败，继续尝试下发配置中的规则。");
     }
 
+    LogRegistryRuleClassStats(L"[*] 注册表规则分类[kernel/block]", config.registryRuleClassStats);
+    LogRegistryRuleClassStats(L"[*] 注册表规则分类[kernel/allow]", config.registryAllowRuleClassStats);
+
     bool allSucceeded = true;
     for (std::vector<REGISTRY_RULE>::const_iterator it = config.registryRules.begin();
         it != config.registryRules.end();
@@ -1224,6 +1255,8 @@ static bool ReloadRulesFromDisk(
     configEvent["process_allow_rule_count"] = activeConfig.processAllowRules.size();
     configEvent["registry_rule_count"] = activeConfig.registryRules.size();
     configEvent["registry_allow_rule_count"] = activeConfig.registryAllowRules.size();
+    AppendRegistryRuleClassStatsFields(configEvent, activeConfig.registryRuleClassStats, "registry_rule_class_");
+    AppendRegistryRuleClassStatsFields(configEvent, activeConfig.registryAllowRuleClassStats, "registry_allow_rule_class_");
     AppendPrefixedConfigFields(configEvent, activeConfig, "");
     if (isHotReload) {
         AppendPrefixedConfigFields(configEvent, previousConfig, "previous_");

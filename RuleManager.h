@@ -39,6 +39,17 @@ struct RegistryRuleDefinition {
     RegistryRuleField valueDataRule;
 };
 
+// Keep HostGuard-side contains expansion aligned with the driver rule store limit.
+#define MAX_REGISTRY_CONTAINS_RULES 16UL
+
+struct RegistryRuleClassStats {
+    ULONG totalRules = 0;
+    ULONG exactRules = 0;
+    ULONG prefixRules = 0;
+    ULONG suffixRules = 0;
+    ULONG containsRules = 0;
+};
+
 struct AutoResponseConfiguration {
     bool terminateOnRegistryBlock = false;
     int minSeverity = 0;
@@ -58,8 +69,10 @@ struct RuleConfiguration {
     std::vector<DetectionRule> processAllowRules;
     std::vector<RegistryRuleDefinition> registryRuleDefinitions;
     std::vector<REGISTRY_RULE> registryRules;
+    RegistryRuleClassStats registryRuleClassStats;
     std::vector<RegistryRuleDefinition> registryAllowRuleDefinitions;
     std::vector<REGISTRY_RULE> registryAllowRules;
+    RegistryRuleClassStats registryAllowRuleClassStats;
 };
 
 class RuleManager {
