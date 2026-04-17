@@ -1063,6 +1063,62 @@ static _Must_inspect_result_ const REGISTRY_RULE* MatchRegistryRuleArray(
     return NULL;
 }
 
+static _Must_inspect_result_ const REGISTRY_RULE* MatchRegistryRuleArrayWithOrdinal(
+    _In_reads_opt_(ruleCount) const REGISTRY_RULE* rules,
+    _In_reads_opt_(ruleCount) const ULONG* ruleOrdinals,
+    _In_ ULONG ruleCount,
+    _In_ ULONG actualOperation,
+    _In_opt_z_ PCWSTR processName,
+    _In_opt_z_ PCWSTR keyPath,
+    _In_opt_z_ PCWSTR infoClass,
+    _In_opt_z_ PCWSTR valueName,
+    _In_opt_z_ PCWSTR valueData,
+    _Out_opt_ PULONG matchedOrdinal) {
+    if (matchedOrdinal != NULL) {
+        *matchedOrdinal = MAXULONG;
+    }
+
+    const REGISTRY_RULE* matchedRule = MatchRegistryRuleArray(
+        rules,
+        ruleCount,
+        actualOperation,
+        processName,
+        keyPath,
+        infoClass,
+        valueName,
+        valueData);
+    if (matchedRule == NULL) {
+        return NULL;
+    }
+
+    ULONG matchIndex = (ULONG)(matchedRule - rules);
+    if (matchedOrdinal != NULL) {
+        if (ruleOrdinals != NULL && matchIndex < ruleCount) {
+            *matchedOrdinal = ruleOrdinals[matchIndex];
+        }
+        else {
+            *matchedOrdinal = matchIndex;
+        }
+    }
+
+    return matchedRule;
+}
+
+static VOID ConsiderRegistryRuleCandidate(
+    _Inout_ const REGISTRY_RULE** bestRule,
+    _Inout_ PULONG bestOrdinal,
+    _In_opt_ const REGISTRY_RULE* candidateRule,
+    _In_ ULONG candidateOrdinal) {
+    if (bestRule == NULL || bestOrdinal == NULL) {
+        return;
+    }
+
+    if (candidateRule != NULL && candidateOrdinal < *bestOrdinal) {
+        *bestRule = candidateRule;
+        *bestOrdinal = candidateOrdinal;
+    }
+}
+
 static _Must_inspect_result_ const REGISTRY_RULE* MatchRegistryRuleStore(
     _In_opt_ const RULE_STORE* store,
     _In_ ULONG actualOperation,
@@ -1072,58 +1128,73 @@ static _Must_inspect_result_ const REGISTRY_RULE* MatchRegistryRuleStore(
     _In_opt_z_ PCWSTR valueName,
     _In_opt_z_ PCWSTR valueData) {
     const REGISTRY_RULE* matchedRule = NULL;
+    ULONG bestOrdinal = MAXULONG;
+    ULONG candidateOrdinal = MAXULONG;
 
     if (store == NULL) {
         return NULL;
     }
 
-    matchedRule = FindExactRegistryRuleMatch(
+    const REGISTRY_RULE* candidateRule = FindExactRegistryRuleMatch(
         store,
         actualOperation,
         processName,
         keyPath,
         infoClass,
         valueName,
-        valueData);
-    if (matchedRule != NULL) {
+        valueData,
+        &candidateOrdinal);
+    ConsiderRegistryRuleCandidate(&matchedRule, &bestOrdinal, candidateRule, candidateOrdinal);
+    if (bestOrdinal == 0) {
         return matchedRule;
     }
 
-    matchedRule = MatchRegistryRuleArray(
+    candidateRule = MatchRegistryRuleArrayWithOrdinal(
         store->PrefixRules,
+        store->PrefixRuleOrdinals,
         store->PrefixRuleCount,
         actualOperation,
         processName,
         keyPath,
         infoClass,
         valueName,
-        valueData);
-    if (matchedRule != NULL) {
+        valueData,
+        &candidateOrdinal);
+    ConsiderRegistryRuleCandidate(&matchedRule, &bestOrdinal, candidateRule, candidateOrdinal);
+    if (bestOrdinal == 0) {
         return matchedRule;
     }
 
-    matchedRule = MatchRegistryRuleArray(
+    candidateRule = MatchRegistryRuleArrayWithOrdinal(
         store->SuffixRules,
+        store->SuffixRuleOrdinals,
         store->SuffixRuleCount,
         actualOperation,
         processName,
         keyPath,
         infoClass,
         valueName,
-        valueData);
-    if (matchedRule != NULL) {
+        valueData,
+        &candidateOrdinal);
+    ConsiderRegistryRuleCandidate(&matchedRule, &bestOrdinal, candidateRule, candidateOrdinal);
+    if (bestOrdinal == 0) {
         return matchedRule;
     }
 
-    return MatchRegistryRuleArray(
+    candidateRule = MatchRegistryRuleArrayWithOrdinal(
         store->ContainsRules,
+        store->ContainsRuleOrdinals,
         store->ContainsRuleCount,
         actualOperation,
         processName,
         keyPath,
         infoClass,
         valueName,
-        valueData);
+        valueData,
+        &candidateOrdinal);
+    ConsiderRegistryRuleCandidate(&matchedRule, &bestOrdinal, candidateRule, candidateOrdinal);
+
+    return matchedRule;
 }
 
 NTSTATUS FileFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags) {

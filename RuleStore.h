@@ -33,9 +33,13 @@ typedef struct _RULE_STORE {
     BOOLEAN ExactRuleTableInitialized;
     RTL_AVL_TABLE ExactRuleTable;
     PREGISTRY_RULE ExactRules;
+    PULONG ExactRuleOrdinals;
     PREGISTRY_RULE PrefixRules;
+    PULONG PrefixRuleOrdinals;
     PREGISTRY_RULE SuffixRules;
+    PULONG SuffixRuleOrdinals;
     PREGISTRY_RULE ContainsRules;
+    PULONG ContainsRuleOrdinals;
 } RULE_STORE, *PRULE_STORE;
 typedef PRULE_STORE* PPRULE_STORE;
 
@@ -51,7 +55,8 @@ const REGISTRY_RULE* FindExactRegistryRuleMatch(
     _In_opt_z_ PCWSTR keyPath,
     _In_opt_z_ PCWSTR infoClass,
     _In_opt_z_ PCWSTR valueName,
-    _In_opt_z_ PCWSTR valueData);
+    _In_opt_z_ PCWSTR valueData,
+    _Out_opt_ PULONG matchedOrdinal);
 NTSTATUS ReplaceRegistryRuleStore(
     _Inout_ PRULE_STORE volatile* targetStore,
     _In_reads_opt_(ruleCount) const REGISTRY_RULE* rules,

@@ -4,6 +4,8 @@
 namespace {
     const ULONG kRuleStorePoolTag = 'tSrR';
     const ULONG kRuleArrayPoolTag = 'rArR';
+    const ULONG kRuleOrdinalPoolTag = 'oOrR';
+    const ULONG kRuleFlattenPoolTag = 'fFrR';
     const ULONG kExactRuleNodePoolTag = 'nExR';
     const ULONG kExactRuleRefPoolTag = 'fExR';
 
@@ -525,9 +527,24 @@ namespace {
         return rules;
     }
 
+    static PULONG AllocateRuleOrdinalArray(_In_ ULONG ruleCount) {
+        if (ruleCount == 0) {
+            return NULL;
+        }
+
+        SIZE_T allocationSize = sizeof(ULONG) * (SIZE_T)ruleCount;
+        return (PULONG)ExAllocatePoolZero(NonPagedPoolNx, allocationSize, kRuleOrdinalPoolTag);
+    }
+
     static VOID FreeRuleArray(_In_opt_ PREGISTRY_RULE rules) {
         if (rules != NULL) {
             ExFreePoolWithTag(rules, kRuleArrayPoolTag);
+        }
+    }
+
+    static VOID FreeRuleOrdinalArray(_In_opt_ PULONG ordinals) {
+        if (ordinals != NULL) {
+            ExFreePoolWithTag(ordinals, kRuleOrdinalPoolTag);
         }
     }
 
@@ -538,9 +555,13 @@ namespace {
 
         DestroyExactRuleTable(store);
         FreeRuleArray(store->ExactRules);
+        FreeRuleOrdinalArray(store->ExactRuleOrdinals);
         FreeRuleArray(store->PrefixRules);
+        FreeRuleOrdinalArray(store->PrefixRuleOrdinals);
         FreeRuleArray(store->SuffixRules);
+        FreeRuleOrdinalArray(store->SuffixRuleOrdinals);
         FreeRuleArray(store->ContainsRules);
+        FreeRuleOrdinalArray(store->ContainsRuleOrdinals);
         ExFreePoolWithTag(store, kRuleStorePoolTag);
     }
 
@@ -610,14 +631,18 @@ namespace {
         store->SuffixRuleCount = suffixCount;
         store->ContainsRuleCount = containsCount;
         store->ExactRules = AllocateRuleArray(exactCount);
+        store->ExactRuleOrdinals = AllocateRuleOrdinalArray(exactCount);
         store->PrefixRules = AllocateRuleArray(prefixCount);
+        store->PrefixRuleOrdinals = AllocateRuleOrdinalArray(prefixCount);
         store->SuffixRules = AllocateRuleArray(suffixCount);
+        store->SuffixRuleOrdinals = AllocateRuleOrdinalArray(suffixCount);
         store->ContainsRules = AllocateRuleArray(containsCount);
+        store->ContainsRuleOrdinals = AllocateRuleOrdinalArray(containsCount);
 
-        if ((exactCount != 0 && store->ExactRules == NULL) ||
-            (prefixCount != 0 && store->PrefixRules == NULL) ||
-            (suffixCount != 0 && store->SuffixRules == NULL) ||
-            (containsCount != 0 && store->ContainsRules == NULL)) {
+        if ((exactCount != 0 && (store->ExactRules == NULL || store->ExactRuleOrdinals == NULL)) ||
+            (prefixCount != 0 && (store->PrefixRules == NULL || store->PrefixRuleOrdinals == NULL)) ||
+            (suffixCount != 0 && (store->SuffixRules == NULL || store->SuffixRuleOrdinals == NULL)) ||
+            (containsCount != 0 && (store->ContainsRules == NULL || store->ContainsRuleOrdinals == NULL))) {
             FreeRuleStore(store);
             return STATUS_INSUFFICIENT_RESOURCES;
         }
@@ -631,15 +656,19 @@ namespace {
             ULONG bucket = ClassifyRegistryRuleBucket(&rules[index]);
             switch (bucket) {
             case RuleStoreBucketExact:
+                store->ExactRuleOrdinals[exactIndex] = index;
                 store->ExactRules[exactIndex++] = rules[index];
                 break;
             case RuleStoreBucketPrefix:
+                store->PrefixRuleOrdinals[prefixIndex] = index;
                 store->PrefixRules[prefixIndex++] = rules[index];
                 break;
             case RuleStoreBucketSuffix:
+                store->SuffixRuleOrdinals[suffixIndex] = index;
                 store->SuffixRules[suffixIndex++] = rules[index];
                 break;
             case RuleStoreBucketContains:
+                store->ContainsRuleOrdinals[containsIndex] = index;
                 store->ContainsRules[containsIndex++] = rules[index];
                 break;
             default:
@@ -658,30 +687,124 @@ namespace {
         return STATUS_SUCCESS;
     }
 
-    static ULONG CopyRuleStoreToFlatBuffer(
-        _In_opt_ const RULE_STORE* store,
-        _Out_writes_opt_(bufferCapacity) PREGISTRY_RULE buffer,
-        _In_ ULONG bufferCapacity) {
-        if (store == NULL || buffer == NULL || bufferCapacity == 0) {
-            return 0;
+    static ULONG ReadBucketRuleOrdinal(
+        _In_reads_opt_(ruleCount) const ULONG* ordinals,
+        _In_ ULONG ruleCount,
+        _In_ ULONG index) {
+        if (index >= ruleCount) {
+            return MAXULONG;
         }
 
-        ULONG copied = 0;
+        if (ordinals == NULL) {
+            return index;
+        }
 
-        auto copyBucket = [&](PREGISTRY_RULE source, ULONG count) {
-            if (source == NULL || count == 0) {
-                return;
+        return ordinals[index];
+    }
+
+    static NTSTATUS CopyRuleBucketToFlatBuffer(
+        _In_reads_opt_(ruleCount) const REGISTRY_RULE* source,
+        _In_reads_opt_(ruleCount) const ULONG* ordinals,
+        _In_ ULONG ruleCount,
+        _Out_writes_(bufferCapacity) PREGISTRY_RULE buffer,
+        _In_ ULONG bufferCapacity,
+        _Inout_updates_(bufferCapacity) PUCHAR occupiedOrdinals,
+        _Inout_ PULONG copiedCount) {
+        if (ruleCount == 0) {
+            return STATUS_SUCCESS;
+        }
+
+        if (source == NULL || ordinals == NULL || buffer == NULL || occupiedOrdinals == NULL || copiedCount == NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        for (ULONG index = 0; index < ruleCount; ++index) {
+            ULONG ordinal = ReadBucketRuleOrdinal(ordinals, ruleCount, index);
+            if (ordinal >= bufferCapacity || occupiedOrdinals[ordinal] != 0) {
+                return STATUS_DATA_ERROR;
             }
 
-            RtlCopyMemory(&buffer[copied], source, sizeof(REGISTRY_RULE) * (SIZE_T)count);
-            copied += count;
-        };
+            buffer[ordinal] = source[index];
+            occupiedOrdinals[ordinal] = 1;
+            *copiedCount += 1;
+        }
 
-        copyBucket(store->ExactRules, store->ExactRuleCount);
-        copyBucket(store->PrefixRules, store->PrefixRuleCount);
-        copyBucket(store->SuffixRules, store->SuffixRuleCount);
-        copyBucket(store->ContainsRules, store->ContainsRuleCount);
-        return copied;
+        return STATUS_SUCCESS;
+    }
+
+    static NTSTATUS CopyRuleStoreToFlatBuffer(
+        _In_opt_ const RULE_STORE* store,
+        _Out_writes_opt_(bufferCapacity) PREGISTRY_RULE buffer,
+        _In_ ULONG bufferCapacity,
+        _Out_ PULONG copiedCount) {
+        if (copiedCount == NULL) {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        *copiedCount = 0;
+        if (store == NULL) {
+            return STATUS_SUCCESS;
+        }
+
+        if (buffer == NULL || bufferCapacity < store->TotalRuleCount) {
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+
+        PUCHAR occupiedOrdinals = (PUCHAR)ExAllocatePoolZero(
+            NonPagedPoolNx,
+            sizeof(UCHAR) * (SIZE_T)bufferCapacity,
+            kRuleFlattenPoolTag);
+        if (occupiedOrdinals == NULL) {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        NTSTATUS status = CopyRuleBucketToFlatBuffer(
+            store->ExactRules,
+            store->ExactRuleOrdinals,
+            store->ExactRuleCount,
+            buffer,
+            bufferCapacity,
+            occupiedOrdinals,
+            copiedCount);
+        if (NT_SUCCESS(status)) {
+            status = CopyRuleBucketToFlatBuffer(
+                store->PrefixRules,
+                store->PrefixRuleOrdinals,
+                store->PrefixRuleCount,
+                buffer,
+                bufferCapacity,
+                occupiedOrdinals,
+                copiedCount);
+        }
+
+        if (NT_SUCCESS(status)) {
+            status = CopyRuleBucketToFlatBuffer(
+                store->SuffixRules,
+                store->SuffixRuleOrdinals,
+                store->SuffixRuleCount,
+                buffer,
+                bufferCapacity,
+                occupiedOrdinals,
+                copiedCount);
+        }
+
+        if (NT_SUCCESS(status)) {
+            status = CopyRuleBucketToFlatBuffer(
+                store->ContainsRules,
+                store->ContainsRuleOrdinals,
+                store->ContainsRuleCount,
+                buffer,
+                bufferCapacity,
+                occupiedOrdinals,
+                copiedCount);
+        }
+
+        if (NT_SUCCESS(status) && *copiedCount != store->TotalRuleCount) {
+            status = STATUS_DATA_ERROR;
+        }
+
+        ExFreePoolWithTag(occupiedOrdinals, kRuleFlattenPoolTag);
+        return status;
     }
 
     static ULONG GetAvailableExactLookupFlags(
@@ -715,7 +838,7 @@ namespace {
         return flags;
     }
 
-    static ULONG GetExactRuleOrdinal(
+    static ULONG GetExactRuleBucketIndex(
         _In_ const RULE_STORE* store,
         _In_ const REGISTRY_RULE* rule) {
         if (store == NULL || store->ExactRules == NULL || rule == NULL) {
@@ -727,6 +850,17 @@ namespace {
         }
 
         return (ULONG)(rule - store->ExactRules);
+    }
+
+    static ULONG GetExactRuleOriginalOrdinal(
+        _In_ const RULE_STORE* store,
+        _In_ const REGISTRY_RULE* rule) {
+        ULONG bucketIndex = GetExactRuleBucketIndex(store, rule);
+        if (bucketIndex == MAXULONG) {
+            return MAXULONG;
+        }
+
+        return ReadBucketRuleOrdinal(store->ExactRuleOrdinals, store->ExactRuleCount, bucketIndex);
     }
 }
 
@@ -789,7 +923,12 @@ const REGISTRY_RULE* FindExactRegistryRuleMatch(
     _In_opt_z_ PCWSTR keyPath,
     _In_opt_z_ PCWSTR infoClass,
     _In_opt_z_ PCWSTR valueName,
-    _In_opt_z_ PCWSTR valueData) {
+    _In_opt_z_ PCWSTR valueData,
+    _Out_opt_ PULONG matchedOrdinal) {
+    if (matchedOrdinal != NULL) {
+        *matchedOrdinal = MAXULONG;
+    }
+
     if (store == NULL ||
         !store->ExactRuleTableInitialized ||
         store->ExactRuleCount == 0) {
@@ -824,22 +963,27 @@ const REGISTRY_RULE* FindExactRegistryRuleMatch(
                 &lookupNode);
         if (matchedNode != NULL &&
             matchedNode->RuleRefCount != 0 &&
-            matchedNode->RuleRefs != NULL &&
-            matchedNode->RuleRefs[0] != NULL) {
-            const REGISTRY_RULE* candidateRule = matchedNode->RuleRefs[0];
-            ULONG candidateOrdinal = GetExactRuleOrdinal(store, candidateRule);
-            if (candidateOrdinal < bestOrdinal) {
-                bestRule = candidateRule;
-                bestOrdinal = candidateOrdinal;
-                if (bestOrdinal == 0) {
-                    break;
+            matchedNode->RuleRefs != NULL) {
+            for (ULONG ruleIndex = 0; ruleIndex < matchedNode->RuleRefCount; ++ruleIndex) {
+                const REGISTRY_RULE* candidateRule = matchedNode->RuleRefs[ruleIndex];
+                ULONG candidateOrdinal = GetExactRuleOriginalOrdinal(store, candidateRule);
+                if (candidateRule != NULL && candidateOrdinal < bestOrdinal) {
+                    bestRule = candidateRule;
+                    bestOrdinal = candidateOrdinal;
+                    if (bestOrdinal == 0) {
+                        break;
+                    }
                 }
             }
         }
 
-        if (matchFlags == 0) {
+        if (bestOrdinal == 0 || matchFlags == 0) {
             break;
         }
+    }
+
+    if (matchedOrdinal != NULL) {
+        *matchedOrdinal = bestOrdinal;
     }
 
     return bestRule;
@@ -933,7 +1077,10 @@ NTSTATUS ApplyRegistryRuleUpdate(
             }
 
             if (snapshot != NULL) {
-                copiedRules = CopyRuleStoreToFlatBuffer(snapshot, flatRules, combinedRuleCount);
+                status = CopyRuleStoreToFlatBuffer(snapshot, flatRules, combinedRuleCount, &copiedRules);
+                if (!NT_SUCCESS(status)) {
+                    goto Cleanup;
+                }
             }
 
             flatRules[copiedRules] = *rule;
