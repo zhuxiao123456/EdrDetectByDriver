@@ -903,54 +903,82 @@ NTSTATUS ApplyRegistryRuleUpdate(
 
     NTSTATUS status = STATUS_SUCCESS;
     PRULE_STORE oldStore = NULL;
+    PRULE_STORE snapshot = NULL;
     PRULE_STORE newStore = NULL;
     PREGISTRY_RULE flatRules = NULL;
-    ULONG oldCount = 0;
     ULONG combinedRuleCount = 0;
     BOOLEAN storeUpdated = FALSE;
+    BOOLEAN retryUpdate = FALSE;
 
-    AcquireExclusiveResourceLock(&g_RuleStoreStateLock);
+    do {
+        oldStore = NULL;
+        snapshot = NULL;
+        newStore = NULL;
+        flatRules = NULL;
+        combinedRuleCount = 0;
+        retryUpdate = FALSE;
 
-    oldStore = (PRULE_STORE)(*targetStore);
-    oldCount = GetRuleStoreTotalRuleCount(oldStore);
-    combinedRuleCount = clearStore ? 0 : oldCount + ((rule != NULL) ? 1 : 0);
+        if (!clearStore) {
+            ULONG copiedRules = 0;
+            ULONG oldCount = 0;
 
-    if (combinedRuleCount != 0) {
-        flatRules = AllocateRuleArray(combinedRuleCount);
-        if (flatRules == NULL) {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-            goto Cleanup;
-        }
+            AcquireRuleStoreSnapshot(targetStore, &snapshot);
+            oldCount = GetRuleStoreTotalRuleCount(snapshot);
+            combinedRuleCount = oldCount + 1;
 
-        ULONG copiedRules = 0;
-        if (!clearStore && oldStore != NULL) {
-            copiedRules = CopyRuleStoreToFlatBuffer(oldStore, flatRules, combinedRuleCount);
-        }
+            flatRules = AllocateRuleArray(combinedRuleCount);
+            if (flatRules == NULL) {
+                status = STATUS_INSUFFICIENT_RESOURCES;
+                goto Cleanup;
+            }
 
-        if (!clearStore && rule != NULL) {
+            if (snapshot != NULL) {
+                copiedRules = CopyRuleStoreToFlatBuffer(snapshot, flatRules, combinedRuleCount);
+            }
+
             flatRules[copiedRules] = *rule;
+
+            status = BuildRuleStoreFromRules(flatRules, combinedRuleCount, &newStore);
+            if (!NT_SUCCESS(status)) {
+                goto Cleanup;
+            }
         }
 
-        status = BuildRuleStoreFromRules(flatRules, combinedRuleCount, &newStore);
-        if (!NT_SUCCESS(status)) {
-            goto Cleanup;
+        AcquireExclusiveResourceLock(&g_RuleStoreStateLock);
+        {
+            PRULE_STORE currentStore = (PRULE_STORE)(*targetStore);
+            if (!clearStore && currentStore != snapshot) {
+                retryUpdate = TRUE;
+            }
+            else {
+                oldStore = (PRULE_STORE)InterlockedExchangePointer(
+                    (PVOID*)targetStore,
+                    clearStore ? NULL : newStore);
+                newStore = NULL;
+                InterlockedIncrement((volatile LONG*)&g_PolicyEpoch);
+                storeUpdated = TRUE;
+
+                if (newRuleCount != NULL) {
+                    *newRuleCount = combinedRuleCount;
+                }
+            }
         }
-    }
-
-    oldStore = (PRULE_STORE)InterlockedExchangePointer((PVOID*)targetStore, newStore);
-    newStore = NULL;
-    InterlockedIncrement((volatile LONG*)&g_PolicyEpoch);
-    storeUpdated = TRUE;
-
-    if (newRuleCount != NULL) {
-        *newRuleCount = combinedRuleCount;
-    }
+        ReleaseExclusiveResourceLock(&g_RuleStoreStateLock);
 
 Cleanup:
-    ReleaseExclusiveResourceLock(&g_RuleStoreStateLock);
+        FreeRuleArray(flatRules);
+        flatRules = NULL;
 
-    FreeRuleArray(flatRules);
-    FreeRuleStore(newStore);
+        FreeRuleStore(newStore);
+        newStore = NULL;
+
+        ReleaseRuleStoreSnapshot(snapshot);
+        snapshot = NULL;
+
+        if (retryUpdate) {
+            continue;
+        }
+    } while (retryUpdate);
 
     if (NT_SUCCESS(status) && storeUpdated) {
         FlushDecisionCache();
