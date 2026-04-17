@@ -117,6 +117,33 @@ static ULONG QueryRuleStoreRuleCount(_In_ PRULE_STORE volatile* currentStore) {
     return count;
 }
 
+static VOID QueryRuleStoreBucketCounts(
+    _In_ PRULE_STORE volatile* currentStore,
+    _Out_ PULONG exactCount,
+    _Out_ PULONG prefixCount,
+    _Out_ PULONG suffixCount,
+    _Out_ PULONG containsCount) {
+    PRULE_STORE snapshot = NULL;
+    ULONG localExactCount = 0;
+    ULONG localPrefixCount = 0;
+    ULONG localSuffixCount = 0;
+    ULONG localContainsCount = 0;
+
+    AcquireRuleStoreSnapshot(currentStore, &snapshot);
+    if (snapshot != NULL) {
+        localExactCount = snapshot->ExactRuleCount;
+        localPrefixCount = snapshot->PrefixRuleCount;
+        localSuffixCount = snapshot->SuffixRuleCount;
+        localContainsCount = snapshot->ContainsRuleCount;
+    }
+    ReleaseRuleStoreSnapshot(snapshot);
+
+    *exactCount = localExactCount;
+    *prefixCount = localPrefixCount;
+    *suffixCount = localSuffixCount;
+    *containsCount = localContainsCount;
+}
+
 static CHAR ToLowerAnsiCharacter(_In_ CHAR character) {
     if (character >= 'A' && character <= 'Z') {
         return (CHAR)(character - 'A' + 'a');
@@ -427,6 +454,18 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
 
     runtimeStatus->RegistryRuleCount = QueryRuleStoreRuleCount(&g_RegistryBlockRuleStore);
     runtimeStatus->RegistryAllowRuleCount = QueryRuleStoreRuleCount(&g_RegistryAllowRuleStore);
+    QueryRuleStoreBucketCounts(
+        &g_RegistryBlockRuleStore,
+        &runtimeStatus->RegistryRuleExactCount,
+        &runtimeStatus->RegistryRulePrefixCount,
+        &runtimeStatus->RegistryRuleSuffixCount,
+        &runtimeStatus->RegistryRuleContainsCount);
+    QueryRuleStoreBucketCounts(
+        &g_RegistryAllowRuleStore,
+        &runtimeStatus->RegistryAllowRuleExactCount,
+        &runtimeStatus->RegistryAllowRulePrefixCount,
+        &runtimeStatus->RegistryAllowRuleSuffixCount,
+        &runtimeStatus->RegistryAllowRuleContainsCount);
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);

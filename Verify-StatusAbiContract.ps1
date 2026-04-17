@@ -29,6 +29,14 @@ if ($sharedHeaderText -notmatch 'typedef struct _DRIVER_RUNTIME_STATUS\s*\{\s*UL
 
 $requiredRuntimeStatusFields = @(
     'PolicyEpoch',
+    'RegistryRuleExactCount',
+    'RegistryRulePrefixCount',
+    'RegistryRuleSuffixCount',
+    'RegistryRuleContainsCount',
+    'RegistryAllowRuleExactCount',
+    'RegistryAllowRulePrefixCount',
+    'RegistryAllowRuleSuffixCount',
+    'RegistryAllowRuleContainsCount',
     'FastPathHitCount',
     'CacheHitCount',
     'CacheMissCount',
@@ -52,6 +60,23 @@ if ($ioctlDispatchText -notmatch 'runtimeStatus->AbiVersion\s*=\s*PEBMONITOR_ABI
 
 if ($ioctlDispatchText -notmatch 'runtimeStatus->PolicyEpoch') {
     throw 'FillDriverRuntimeStatus must populate PolicyEpoch.'
+}
+
+$requiredIoctlAssignments = @(
+    'runtimeStatus->RegistryRuleExactCount',
+    'runtimeStatus->RegistryRulePrefixCount',
+    'runtimeStatus->RegistryRuleSuffixCount',
+    'runtimeStatus->RegistryRuleContainsCount',
+    'runtimeStatus->RegistryAllowRuleExactCount',
+    'runtimeStatus->RegistryAllowRulePrefixCount',
+    'runtimeStatus->RegistryAllowRuleSuffixCount',
+    'runtimeStatus->RegistryAllowRuleContainsCount'
+)
+
+foreach ($assignment in $requiredIoctlAssignments) {
+    if ($ioctlDispatchText -notmatch [regex]::Escape($assignment)) {
+        throw "FillDriverRuntimeStatus must populate $assignment."
+    }
 }
 
 Write-Host '[+] Driver ABI/runtime status contract checks passed.'
