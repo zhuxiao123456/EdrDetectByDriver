@@ -1077,9 +1077,8 @@ static _Must_inspect_result_ const REGISTRY_RULE* MatchRegistryRuleStore(
         return NULL;
     }
 
-    matchedRule = MatchRegistryRuleArray(
-        store->ExactRules,
-        store->ExactRuleCount,
+    matchedRule = FindExactRegistryRuleMatch(
+        store,
         actualOperation,
         processName,
         keyPath,
