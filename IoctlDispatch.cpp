@@ -36,6 +36,29 @@ static ULONG ReadInterlockedFlags(_In_ volatile LONG* value) {
     return (ULONG)InterlockedCompareExchange(value, 0, 0);
 }
 
+static VOID SanitizeRegistryRule(_Inout_ PREGISTRY_RULE rule) {
+    if (rule == NULL) {
+        return;
+    }
+
+    rule->RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
+    rule->ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
+    rule->KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
+    rule->InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
+    rule->ValueName[MAX_RULE_LENGTH - 1] = L'\0';
+    rule->ValueData[MAX_RULE_LENGTH - 1] = L'\0';
+}
+
+static ULONG QueryRuleStoreRuleCount(_In_ PRULE_STORE volatile* currentStore) {
+    PRULE_STORE snapshot = NULL;
+    ULONG count = 0;
+
+    AcquireRuleStoreSnapshot(currentStore, &snapshot);
+    count = GetRuleStoreTotalRuleCount(snapshot);
+    ReleaseRuleStoreSnapshot(snapshot);
+    return count;
+}
+
 static CHAR ToLowerAnsiCharacter(_In_ CHAR character) {
     if (character >= 'A' && character <= 'Z') {
         return (CHAR)(character - 'A' + 'a');
@@ -344,13 +367,8 @@ static VOID FillDriverRuntimeStatus(_Out_ PDRIVER_RUNTIME_STATUS runtimeStatus) 
     RtlStringCchCopyW(runtimeStatus->GeneratedAt, RTL_NUMBER_OF(runtimeStatus->GeneratedAt), g_ActiveGeneratedAt);
     ReleaseSharedResourceLock(&g_RuntimeStatusLock);
 
-    AcquireSharedResourceLock(&g_RegistryRuleLock);
-    runtimeStatus->RegistryRuleCount = g_RegistryRuleCount;
-    ReleaseSharedResourceLock(&g_RegistryRuleLock);
-
-    AcquireSharedResourceLock(&g_RegistryAllowRuleLock);
-    runtimeStatus->RegistryAllowRuleCount = g_RegistryAllowRuleCount;
-    ReleaseSharedResourceLock(&g_RegistryAllowRuleLock);
+    runtimeStatus->RegistryRuleCount = QueryRuleStoreRuleCount(&g_RegistryBlockRuleStore);
+    runtimeStatus->RegistryAllowRuleCount = QueryRuleStoreRuleCount(&g_RegistryAllowRuleStore);
 
     KIRQL oldIrql;
     KeAcquireSpinLock(&g_DriverQueueLock, &oldIrql);
@@ -532,34 +550,23 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         }
         PREGISTRY_RULE rule = (PREGISTRY_RULE)Irp->AssociatedIrp.SystemBuffer;
         REGISTRY_RULE sanitizedRule = *rule;
+        SanitizeRegistryRule(&sanitizedRule);
 
-        sanitizedRule.RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
-        sanitizedRule.ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
-        sanitizedRule.KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
-        sanitizedRule.InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
-        sanitizedRule.ValueName[MAX_RULE_LENGTH - 1] = L'\0';
-        sanitizedRule.ValueData[MAX_RULE_LENGTH - 1] = L'\0';
-
-        AcquireExclusiveResourceLock(&g_RegistryRuleLock);
-        if (g_RegistryRuleCount < MAX_REGISTRY_RULE_COUNT) {
-            RtlCopyMemory(&g_RegistryRules[g_RegistryRuleCount], &sanitizedRule, sizeof(REGISTRY_RULE));
-            g_RegistryRuleCount++;
-            status = STATUS_SUCCESS;
-        }
-        else {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-        ReleaseExclusiveResourceLock(&g_RegistryRuleLock);
+        status = ApplyRegistryRuleUpdate(
+            &g_RegistryBlockRuleStore,
+            &sanitizedRule,
+            FALSE,
+            NULL);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_REGISTRY_RULES: {
-        AcquireExclusiveResourceLock(&g_RegistryRuleLock);
-        g_RegistryRuleCount = 0;
-        RtlZeroMemory(g_RegistryRules, sizeof(g_RegistryRules));
-        ReleaseExclusiveResourceLock(&g_RegistryRuleLock);
-        status = STATUS_SUCCESS;
+        status = ApplyRegistryRuleUpdate(
+            &g_RegistryBlockRuleStore,
+            NULL,
+            TRUE,
+            NULL);
         Irp->IoStatus.Information = 0;
         break;
     }
@@ -571,34 +578,23 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         }
         PREGISTRY_RULE rule = (PREGISTRY_RULE)Irp->AssociatedIrp.SystemBuffer;
         REGISTRY_RULE sanitizedRule = *rule;
+        SanitizeRegistryRule(&sanitizedRule);
 
-        sanitizedRule.RuleId[MAX_RULE_ID_LENGTH - 1] = L'\0';
-        sanitizedRule.ProcessName[MAX_RULE_LENGTH - 1] = L'\0';
-        sanitizedRule.KeyPath[MAX_REG_PATH_LENGTH - 1] = L'\0';
-        sanitizedRule.InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
-        sanitizedRule.ValueName[MAX_RULE_LENGTH - 1] = L'\0';
-        sanitizedRule.ValueData[MAX_RULE_LENGTH - 1] = L'\0';
-
-        AcquireExclusiveResourceLock(&g_RegistryAllowRuleLock);
-        if (g_RegistryAllowRuleCount < MAX_REGISTRY_RULE_COUNT) {
-            RtlCopyMemory(&g_RegistryAllowRules[g_RegistryAllowRuleCount], &sanitizedRule, sizeof(REGISTRY_RULE));
-            g_RegistryAllowRuleCount++;
-            status = STATUS_SUCCESS;
-        }
-        else {
-            status = STATUS_INSUFFICIENT_RESOURCES;
-        }
-        ReleaseExclusiveResourceLock(&g_RegistryAllowRuleLock);
+        status = ApplyRegistryRuleUpdate(
+            &g_RegistryAllowRuleStore,
+            &sanitizedRule,
+            FALSE,
+            NULL);
         Irp->IoStatus.Information = 0;
         break;
     }
 
     case IOCTL_CLEAR_REGISTRY_ALLOW_RULES: {
-        AcquireExclusiveResourceLock(&g_RegistryAllowRuleLock);
-        g_RegistryAllowRuleCount = 0;
-        RtlZeroMemory(g_RegistryAllowRules, sizeof(g_RegistryAllowRules));
-        ReleaseExclusiveResourceLock(&g_RegistryAllowRuleLock);
-        status = STATUS_SUCCESS;
+        status = ApplyRegistryRuleUpdate(
+            &g_RegistryAllowRuleStore,
+            NULL,
+            TRUE,
+            NULL);
         Irp->IoStatus.Information = 0;
         break;
     }

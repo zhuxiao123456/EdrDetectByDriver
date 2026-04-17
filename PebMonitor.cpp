@@ -18,13 +18,6 @@ volatile LONG64 g_DriverEventDropCount = 0;
 volatile LONG64 g_DriverEventAllocFailCount = 0;
 NPAGED_LOOKASIDE_LIST g_DriverEventLookaside;
 
-REGISTRY_RULE g_RegistryRules[MAX_REGISTRY_RULE_COUNT];
-ULONG g_RegistryRuleCount = 0;
-ERESOURCE g_RegistryRuleLock = {};
-
-REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
-ULONG g_RegistryAllowRuleCount = 0;
-ERESOURCE g_RegistryAllowRuleLock = {};
 ERESOURCE g_RuleStoreStateLock = {};
 PRULE_STORE volatile g_RegistryBlockRuleStore = NULL;
 PRULE_STORE volatile g_RegistryAllowRuleStore = NULL;
@@ -365,8 +358,6 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
     ResetRuntimeConfigInfo();
     ExDeleteResourceLite(&g_RuntimeStatusLock);
     ExDeleteResourceLite(&g_RuleStoreStateLock);
-    ExDeleteResourceLite(&g_RegistryAllowRuleLock);
-    ExDeleteResourceLite(&g_RegistryRuleLock);
     ExDeleteResourceLite(&g_ProcessPortLock);
 
     UNICODE_STRING symLink = RTL_CONSTANT_STRING(L"\\DosDevices\\PebMonitor");
@@ -405,8 +396,6 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN registryCallbackRegistered = FALSE;
     BOOLEAN processCallbackRegistered = FALSE;
     BOOLEAN processPortLockInitialized = FALSE;
-    BOOLEAN registryRuleLockInitialized = FALSE;
-    BOOLEAN registryAllowRuleLockInitialized = FALSE;
     BOOLEAN ruleStoreStateLockInitialized = FALSE;
     BOOLEAN runtimeStatusLockInitialized = FALSE;
     BOOLEAN ruleStoreInitialized = FALSE;
@@ -445,22 +434,6 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     g_ProcessServerPort = NULL;
     g_ProcessClientPort = NULL;
     g_ProcessPortConnected = 0;
-
-    status = ExInitializeResourceLite(&g_RegistryRuleLock);
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-    registryRuleLockInitialized = TRUE;
-    g_RegistryRuleCount = 0;
-    RtlZeroMemory(g_RegistryRules, sizeof(g_RegistryRules));
-
-    status = ExInitializeResourceLite(&g_RegistryAllowRuleLock);
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-    registryAllowRuleLockInitialized = TRUE;
-    g_RegistryAllowRuleCount = 0;
-    RtlZeroMemory(g_RegistryAllowRules, sizeof(g_RegistryAllowRules));
 
     status = ExInitializeResourceLite(&g_RuntimeStatusLock);
     if (!NT_SUCCESS(status)) {
@@ -665,12 +638,6 @@ Cleanup:
     }
     if (ruleStoreStateLockInitialized) {
         ExDeleteResourceLite(&g_RuleStoreStateLock);
-    }
-    if (registryAllowRuleLockInitialized) {
-        ExDeleteResourceLite(&g_RegistryAllowRuleLock);
-    }
-    if (registryRuleLockInitialized) {
-        ExDeleteResourceLite(&g_RegistryRuleLock);
     }
     if (processPortLockInitialized) {
         ExDeleteResourceLite(&g_ProcessPortLock);

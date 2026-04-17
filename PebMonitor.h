@@ -63,13 +63,6 @@ extern ULONG g_DriverEventCount;
 extern volatile LONG64 g_DriverEventDropCount;
 extern volatile LONG64 g_DriverEventAllocFailCount;
 
-extern REGISTRY_RULE g_RegistryRules[MAX_REGISTRY_RULE_COUNT];
-extern ULONG g_RegistryRuleCount;
-extern ERESOURCE g_RegistryRuleLock;
-
-extern REGISTRY_RULE g_RegistryAllowRules[MAX_REGISTRY_RULE_COUNT];
-extern ULONG g_RegistryAllowRuleCount;
-extern ERESOURCE g_RegistryAllowRuleLock;
 extern ERESOURCE g_RuleStoreStateLock;
 extern PRULE_STORE volatile g_RegistryBlockRuleStore;
 extern PRULE_STORE volatile g_RegistryAllowRuleStore;
