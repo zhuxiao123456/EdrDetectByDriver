@@ -401,6 +401,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN ruleStoreInitialized = FALSE;
     BOOLEAN decisionCacheInitialized = FALSE;
     BOOLEAN fastPathInitialized = FALSE;
+    BOOLEAN rundownProtectionInitialized = FALSE;
     PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     UNICODE_STRING processPortName = { 0 };
     OBJECT_ATTRIBUTES processPortAttributes = { 0 };
@@ -494,6 +495,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     fastPathInitialized = TRUE;
 
     ExInitializeRundownProtection(&g_RundownRef);
+    rundownProtectionInitialized = TRUE;
 
     status = IoCreateDevice(
         DriverObject,
@@ -609,6 +611,10 @@ Cleanup:
     if (filterRegistered) {
         FltUnregisterFilter(g_FilterHandle);
         g_FilterHandle = NULL;
+    }
+
+    if (rundownProtectionInitialized) {
+        ExWaitForRundownProtectionRelease(&g_RundownRef);
     }
 
     if (symbolicLinkCreated) {
