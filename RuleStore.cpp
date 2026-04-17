@@ -845,6 +845,49 @@ const REGISTRY_RULE* FindExactRegistryRuleMatch(
     return bestRule;
 }
 
+NTSTATUS ReplaceRegistryRuleStore(
+    _Inout_ PRULE_STORE volatile* targetStore,
+    _In_reads_opt_(ruleCount) const REGISTRY_RULE* rules,
+    _In_ ULONG ruleCount,
+    _Out_opt_ PULONG newRuleCount) {
+    if (targetStore == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (ruleCount != 0 && rules == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    NTSTATUS status = STATUS_SUCCESS;
+    PRULE_STORE oldStore = NULL;
+    PRULE_STORE newStore = NULL;
+
+    if (ruleCount != 0) {
+        status = BuildRuleStoreFromRules(rules, ruleCount, &newStore);
+        if (!NT_SUCCESS(status)) {
+            return status;
+        }
+    }
+
+    AcquireExclusiveResourceLock(&g_RuleStoreStateLock);
+    oldStore = (PRULE_STORE)InterlockedExchangePointer((PVOID*)targetStore, newStore);
+    newStore = NULL;
+    InterlockedIncrement((volatile LONG*)&g_PolicyEpoch);
+    if (newRuleCount != NULL) {
+        *newRuleCount = ruleCount;
+    }
+    ReleaseExclusiveResourceLock(&g_RuleStoreStateLock);
+
+    FlushDecisionCache();
+
+    if (oldStore != NULL) {
+        WaitForRuleStoreReferencesToDrain(oldStore);
+        FreeRuleStore(oldStore);
+    }
+
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS ApplyRegistryRuleUpdate(
     _Inout_ PRULE_STORE volatile* targetStore,
     _In_opt_ const REGISTRY_RULE* rule,

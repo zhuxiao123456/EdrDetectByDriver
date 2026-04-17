@@ -52,6 +52,11 @@ const REGISTRY_RULE* FindExactRegistryRuleMatch(
     _In_opt_z_ PCWSTR infoClass,
     _In_opt_z_ PCWSTR valueName,
     _In_opt_z_ PCWSTR valueData);
+NTSTATUS ReplaceRegistryRuleStore(
+    _Inout_ PRULE_STORE volatile* targetStore,
+    _In_reads_opt_(ruleCount) const REGISTRY_RULE* rules,
+    _In_ ULONG ruleCount,
+    _Out_opt_ PULONG newRuleCount);
 NTSTATUS ApplyRegistryRuleUpdate(
     _Inout_ PRULE_STORE volatile* targetStore,
     _In_opt_ const REGISTRY_RULE* rule,

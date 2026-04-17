@@ -3,6 +3,8 @@
 EXTERN_C POBJECT_TYPE* PsProcessType;
 EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
 
+static const ULONG kRuleBatchPoolTag = 'bRgR';
+
 static const UNICODE_STRING g_ProtectedProcessPathSuffixes[] = {
     RTL_CONSTANT_STRING(L"\\Windows\\System32\\smss.exe"),
     RTL_CONSTANT_STRING(L"\\Windows\\System32\\csrss.exe"),
@@ -47,6 +49,62 @@ static VOID SanitizeRegistryRule(_Inout_ PREGISTRY_RULE rule) {
     rule->InfoClass[MAX_RULE_LENGTH - 1] = L'\0';
     rule->ValueName[MAX_RULE_LENGTH - 1] = L'\0';
     rule->ValueData[MAX_RULE_LENGTH - 1] = L'\0';
+}
+
+static VOID FreeSanitizedRegistryRuleBatch(_In_opt_ PREGISTRY_RULE rules) {
+    if (rules != NULL) {
+        ExFreePoolWithTag(rules, kRuleBatchPoolTag);
+    }
+}
+
+static NTSTATUS CaptureSanitizedRegistryRuleBatch(
+    _In_reads_bytes_(inputBufferLength) const VOID* inputBuffer,
+    _In_ ULONG inputBufferLength,
+    _Outptr_result_buffer_maybenull_(*outRuleCount) PREGISTRY_RULE* outRules,
+    _Out_ PULONG outRuleCount) {
+    if (outRules == NULL || outRuleCount == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *outRules = NULL;
+    *outRuleCount = 0;
+
+    const SIZE_T headerSize = FIELD_OFFSET(REGISTRY_RULE_BATCH_UPDATE, Rules);
+    if (inputBuffer == NULL || inputBufferLength < headerSize) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    const REGISTRY_RULE_BATCH_UPDATE* batchUpdate =
+        (const REGISTRY_RULE_BATCH_UPDATE*)inputBuffer;
+    if (!PEBMONITOR_ABI_IS_COMPAT(batchUpdate->AbiVersion)) {
+        return STATUS_REVISION_MISMATCH;
+    }
+
+    const ULONG ruleCount = batchUpdate->RuleCount;
+    const SIZE_T ruleBytes = sizeof(REGISTRY_RULE) * (SIZE_T)ruleCount;
+    const SIZE_T requiredSize = headerSize + ruleBytes;
+    if ((SIZE_T)inputBufferLength < requiredSize) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    if (ruleCount == 0) {
+        return STATUS_SUCCESS;
+    }
+
+    PREGISTRY_RULE sanitizedRules =
+        (PREGISTRY_RULE)ExAllocatePoolZero(NonPagedPoolNx, ruleBytes, kRuleBatchPoolTag);
+    if (sanitizedRules == NULL) {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlCopyMemory(sanitizedRules, batchUpdate->Rules, ruleBytes);
+    for (ULONG index = 0; index < ruleCount; ++index) {
+        SanitizeRegistryRule(&sanitizedRules[index]);
+    }
+
+    *outRules = sanitizedRules;
+    *outRuleCount = ruleCount;
+    return STATUS_SUCCESS;
 }
 
 static ULONG QueryRuleStoreRuleCount(_In_ PRULE_STORE volatile* currentStore) {
@@ -571,6 +629,28 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
         break;
     }
 
+    case IOCTL_REPLACE_REGISTRY_RULES: {
+        PREGISTRY_RULE sanitizedRules = NULL;
+        ULONG ruleCount = 0;
+
+        status = CaptureSanitizedRegistryRuleBatch(
+            Irp->AssociatedIrp.SystemBuffer,
+            inBufLength,
+            &sanitizedRules,
+            &ruleCount);
+        if (NT_SUCCESS(status)) {
+            status = ReplaceRegistryRuleStore(
+                &g_RegistryBlockRuleStore,
+                sanitizedRules,
+                ruleCount,
+                NULL);
+        }
+
+        FreeSanitizedRegistryRuleBatch(sanitizedRules);
+        Irp->IoStatus.Information = 0;
+        break;
+    }
+
     case IOCTL_ADD_REGISTRY_ALLOW_RULE: {
         if (inBufLength < sizeof(REGISTRY_RULE)) {
             status = STATUS_BUFFER_TOO_SMALL;
@@ -595,6 +675,28 @@ NTSTATUS DispatchDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
             NULL,
             TRUE,
             NULL);
+        Irp->IoStatus.Information = 0;
+        break;
+    }
+
+    case IOCTL_REPLACE_REGISTRY_ALLOW_RULES: {
+        PREGISTRY_RULE sanitizedRules = NULL;
+        ULONG ruleCount = 0;
+
+        status = CaptureSanitizedRegistryRuleBatch(
+            Irp->AssociatedIrp.SystemBuffer,
+            inBufLength,
+            &sanitizedRules,
+            &ruleCount);
+        if (NT_SUCCESS(status)) {
+            status = ReplaceRegistryRuleStore(
+                &g_RegistryAllowRuleStore,
+                sanitizedRules,
+                ruleCount,
+                NULL);
+        }
+
+        FreeSanitizedRegistryRuleBatch(sanitizedRules);
         Irp->IoStatus.Information = 0;
         break;
     }
