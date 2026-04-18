@@ -333,6 +333,7 @@ void UnloadDriver(PDRIVER_OBJECT DriverObject) {
     CleanupRuleStoreState();
     CleanupDecisionCacheState();
     CleanupFastPathState();
+    CleanupFileProtectionState();
 
     PIRP irpToCancel = (PIRP)InterlockedExchangePointer((PVOID*)&g_PendingDriverIrp, NULL);
     if (irpToCancel != NULL) {
@@ -401,6 +402,7 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     BOOLEAN ruleStoreInitialized = FALSE;
     BOOLEAN decisionCacheInitialized = FALSE;
     BOOLEAN fastPathInitialized = FALSE;
+    BOOLEAN fileProtectionInitialized = FALSE;
     BOOLEAN rundownProtectionInitialized = FALSE;
     PSECURITY_DESCRIPTOR securityDescriptor = NULL;
     UNICODE_STRING processPortName = { 0 };
@@ -493,6 +495,12 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
         goto Cleanup;
     }
     fastPathInitialized = TRUE;
+
+    status = InitializeFileProtectionState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    fileProtectionInitialized = TRUE;
 
     ExInitializeRundownProtection(&g_RundownRef);
     rundownProtectionInitialized = TRUE;
@@ -632,6 +640,9 @@ Cleanup:
 
     if (fastPathInitialized) {
         CleanupFastPathState();
+    }
+    if (fileProtectionInitialized) {
+        CleanupFileProtectionState();
     }
     if (decisionCacheInitialized) {
         CleanupDecisionCacheState();

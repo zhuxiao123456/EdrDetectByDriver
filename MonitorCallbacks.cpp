@@ -314,6 +314,7 @@ static VOID QueueProcessObservedEvent(
 }
 
 const FLT_OPERATION_REGISTRATION g_FilterOperationCallbacks[] = {
+    { IRP_MJ_CREATE, 0, FileProtectionPreCreate, NULL },
     { IRP_MJ_OPERATION_END }
 };
 

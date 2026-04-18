@@ -28,6 +28,9 @@
     <ClCompile Include="FastPath.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="FileProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="IoctlDispatch.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -52,6 +55,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="FastPath.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="FileProtection.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="OsVersionHelper.h">

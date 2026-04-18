@@ -6,6 +6,7 @@
 #include "Shared.h"
 #include "FastPath.h"
 #include "DecisionCache.h"
+#include "FileProtection.h"
 #include "RuleStore.h"
 
 #ifndef PROCESS_TERMINATE
