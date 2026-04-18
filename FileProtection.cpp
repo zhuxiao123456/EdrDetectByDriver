@@ -2,6 +2,83 @@
 
 static FILE_PROTECTION_STATE g_FileProtectionState = {};
 static const WCHAR g_ProtectedDriverPathSuffixBuffer[] = L"\\Windows\\System32\\drivers\\DriverModule.sys";
+static const WCHAR g_FileProtectionRuleId[] = L"driver_self_protection";
+
+EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
+
+static VOID CopyAnsiProcessNameToWideBuffer(
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_opt_z_ PCSTR source) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    if (source == NULL || source[0] == '\0') {
+        return;
+    }
+
+    SIZE_T writeIndex = 0;
+    while (writeIndex + 1 < bufferLength && source[writeIndex] != '\0') {
+        CHAR character = source[writeIndex];
+        if (character >= 'A' && character <= 'Z') {
+            character = (CHAR)(character - 'A' + 'a');
+        }
+
+        buffer[writeIndex] = (WCHAR)(UCHAR)character;
+        writeIndex++;
+    }
+
+    buffer[writeIndex] = L'\0';
+}
+
+static VOID CopyWideStringToFixedBuffer(
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_opt_z_ PCWSTR source) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    if (source == NULL || source[0] == L'\0') {
+        return;
+    }
+
+    NTSTATUS status = RtlStringCchCopyW(buffer, bufferLength, source);
+    if (!NT_SUCCESS(status)) {
+        buffer[bufferLength - 1] = L'\0';
+    }
+}
+
+static VOID CopyUnicodeStringToFixedBuffer(
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_opt_ PCUNICODE_STRING source) {
+    if (buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    if (source == NULL || source->Buffer == NULL || source->Length == 0) {
+        return;
+    }
+
+    ULONG copyBytes = source->Length;
+    ULONG maxBytes = (ULONG)((bufferLength - 1) * sizeof(WCHAR));
+    if (copyBytes > maxBytes) {
+        copyBytes = maxBytes;
+    }
+
+    copyBytes -= (copyBytes % sizeof(WCHAR));
+    if (copyBytes == 0) {
+        return;
+    }
+
+    RtlCopyMemory(buffer, source->Buffer, copyBytes);
+    buffer[copyBytes / sizeof(WCHAR)] = L'\0';
+}
 
 static BOOLEAN IsDangerousCreateRequest(_In_ PFLT_CALLBACK_DATA Data) {
     if (Data == NULL || Data->Iopb == NULL) {
@@ -58,6 +135,38 @@ static BOOLEAN IsProtectedDriverPath(_In_ PCUNICODE_STRING normalizedName) {
         &g_FileProtectionState.ProtectedDriverPathSuffix);
 }
 
+static VOID QueueBlockedFileProtectionEvent(
+    _In_ PFLT_CALLBACK_DATA Data,
+    _In_ PCUNICODE_STRING normalizedName) {
+    PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
+    if (node == NULL) {
+        InterlockedIncrement64(&g_DriverEventAllocFailCount);
+        return;
+    }
+
+    node->EventData.EventType = DRIVER_EVENT_TYPE_BLOCKED_FILE_OPERATION;
+    node->EventData.Severity = 100;
+    CopyWideStringToFixedBuffer(
+        node->EventData.RuleId,
+        RTL_NUMBER_OF(node->EventData.RuleId),
+        g_FileProtectionRuleId);
+    CopyUnicodeStringToFixedBuffer(
+        node->EventData.TargetPath,
+        RTL_NUMBER_OF(node->EventData.TargetPath),
+        normalizedName);
+
+    PEPROCESS requestorProcess = FltGetRequestorProcess(Data);
+    if (requestorProcess != NULL) {
+        node->EventData.ProcessId = HandleToULong(PsGetProcessId(requestorProcess));
+        CopyAnsiProcessNameToWideBuffer(
+            node->EventData.ProcessName,
+            RTL_NUMBER_OF(node->EventData.ProcessName),
+            PsGetProcessImageFileName(requestorProcess));
+    }
+
+    QueueDriverEventNode(node);
+}
+
 NTSTATUS InitializeFileProtectionState() {
     RtlZeroMemory(&g_FileProtectionState, sizeof(g_FileProtectionState));
     RtlInitUnicodeString(
@@ -103,6 +212,7 @@ FLT_PREOP_CALLBACK_STATUS FileProtectionPreCreate(
 
     if (blockRequest) {
         KdPrint(("[PebMonitor] WARN: Blocking write/delete access to protected driver file.\n"));
+        QueueBlockedFileProtectionEvent(Data, &nameInfo->Name);
         Data->IoStatus.Status = STATUS_ACCESS_DENIED;
         Data->IoStatus.Information = 0;
         FltReleaseFileNameInformation(nameInfo);

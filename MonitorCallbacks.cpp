@@ -219,7 +219,7 @@ static VOID ExtractProcessNameFromPathBuffer(
     buffer[writeIndex] = L'\0';
 }
 
-static VOID EnqueueDriverEventNode(_Inout_opt_ PDRIVER_EVENT_NODE node) {
+VOID QueueDriverEventNode(_Inout_opt_ PDRIVER_EVENT_NODE node) {
     if (node == NULL) {
         return;
     }
@@ -289,7 +289,7 @@ static VOID QueueKernelEvent(
     CopyWideStringToFixedBuffer(node->EventData.InfoClass, RTL_NUMBER_OF(node->EventData.InfoClass), infoClass);
     CopyUnicodeStringToFixedBuffer(node->EventData.ValueName, RTL_NUMBER_OF(node->EventData.ValueName), valueName);
     CopyWideStringToFixedBuffer(node->EventData.ValueData, RTL_NUMBER_OF(node->EventData.ValueData), valueData);
-    EnqueueDriverEventNode(node);
+    QueueDriverEventNode(node);
 }
 
 static VOID QueueProcessObservedEvent(
@@ -310,7 +310,7 @@ static VOID QueueProcessObservedEvent(
     CopyWideStringToFixedBuffer(node->EventData.ProcessName, RTL_NUMBER_OF(node->EventData.ProcessName), processName);
     CopyWideStringToFixedBuffer(node->EventData.CommandLine, RTL_NUMBER_OF(node->EventData.CommandLine), commandLine);
     CopyWideStringToFixedBuffer(node->EventData.TargetPath, RTL_NUMBER_OF(node->EventData.TargetPath), imagePath);
-    EnqueueDriverEventNode(node);
+    QueueDriverEventNode(node);
 }
 
 const FLT_OPERATION_REGISTRATION g_FilterOperationCallbacks[] = {

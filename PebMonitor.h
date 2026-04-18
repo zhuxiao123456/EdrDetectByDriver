@@ -122,6 +122,8 @@ FORCEINLINE VOID FreeDriverEventNode(_In_opt_ PDRIVER_EVENT_NODE node) {
     }
 }
 
+VOID QueueDriverEventNode(_Inout_opt_ PDRIVER_EVENT_NODE node);
+
 _IRQL_requires_(PASSIVE_LEVEL)
 void ProcessNotifyCallbackEx(_Inout_ PEPROCESS Process, _In_ HANDLE ProcessId, _Inout_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo);
 _IRQL_requires_max_(APC_LEVEL)
