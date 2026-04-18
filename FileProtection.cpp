@@ -107,6 +107,28 @@ static BOOLEAN IsDangerousCreateRequest(_In_ PFLT_CALLBACK_DATA Data) {
         createDisposition == FILE_OVERWRITE_IF);
 }
 
+static BOOLEAN IsDangerousSetInformationClass(_In_ FILE_INFORMATION_CLASS fileInformationClass) {
+    return (fileInformationClass == FileDispositionInformation ||
+        fileInformationClass == FileDispositionInformationEx ||
+        fileInformationClass == FileRenameInformation ||
+        fileInformationClass == FileRenameInformationEx);
+}
+
+static PCWSTR GetSetInformationClassName(_In_ FILE_INFORMATION_CLASS fileInformationClass) {
+    switch (fileInformationClass) {
+    case FileDispositionInformation:
+        return L"FileDispositionInformation";
+    case FileDispositionInformationEx:
+        return L"FileDispositionInformationEx";
+    case FileRenameInformation:
+        return L"FileRenameInformation";
+    case FileRenameInformationEx:
+        return L"FileRenameInformationEx";
+    default:
+        return L"UnknownFileSetInformationClass";
+    }
+}
+
 static BOOLEAN EndsWithUnicodeStringInsensitive(
     _In_ PCUNICODE_STRING value,
     _In_ PCUNICODE_STRING suffix) {
@@ -137,7 +159,8 @@ static BOOLEAN IsProtectedDriverPath(_In_ PCUNICODE_STRING normalizedName) {
 
 static VOID QueueBlockedFileProtectionEvent(
     _In_ PFLT_CALLBACK_DATA Data,
-    _In_ PCUNICODE_STRING normalizedName) {
+    _In_ PCUNICODE_STRING normalizedName,
+    _In_opt_z_ PCWSTR infoClassName) {
     PDRIVER_EVENT_NODE node = AllocateDriverEventNode();
     if (node == NULL) {
         InterlockedIncrement64(&g_DriverEventAllocFailCount);
@@ -154,6 +177,10 @@ static VOID QueueBlockedFileProtectionEvent(
         node->EventData.TargetPath,
         RTL_NUMBER_OF(node->EventData.TargetPath),
         normalizedName);
+    CopyWideStringToFixedBuffer(
+        node->EventData.InfoClass,
+        RTL_NUMBER_OF(node->EventData.InfoClass),
+        infoClassName);
 
     PEPROCESS requestorProcess = FltGetRequestorProcess(Data);
     if (requestorProcess != NULL) {
@@ -165,6 +192,16 @@ static VOID QueueBlockedFileProtectionEvent(
     }
 
     QueueDriverEventNode(node);
+}
+
+static FLT_PREOP_CALLBACK_STATUS CompleteBlockedProtectedFileRequest(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCUNICODE_STRING normalizedName,
+    _In_opt_z_ PCWSTR infoClassName) {
+    QueueBlockedFileProtectionEvent(Data, normalizedName, infoClassName);
+    Data->IoStatus.Status = STATUS_ACCESS_DENIED;
+    Data->IoStatus.Information = 0;
+    return FLT_PREOP_COMPLETE;
 }
 
 NTSTATUS InitializeFileProtectionState() {
@@ -212,11 +249,58 @@ FLT_PREOP_CALLBACK_STATUS FileProtectionPreCreate(
 
     if (blockRequest) {
         KdPrint(("[PebMonitor] WARN: Blocking write/delete access to protected driver file.\n"));
-        QueueBlockedFileProtectionEvent(Data, &nameInfo->Name);
-        Data->IoStatus.Status = STATUS_ACCESS_DENIED;
-        Data->IoStatus.Information = 0;
+        FLT_PREOP_CALLBACK_STATUS result = CompleteBlockedProtectedFileRequest(
+            Data,
+            &nameInfo->Name,
+            NULL);
         FltReleaseFileNameInformation(nameInfo);
-        return FLT_PREOP_COMPLETE;
+        return result;
+    }
+
+    FltReleaseFileNameInformation(nameInfo);
+    return FLT_PREOP_SUCCESS_NO_CALLBACK;
+}
+
+FLT_PREOP_CALLBACK_STATUS FileProtectionPreSetInformation(
+    _Inout_ PFLT_CALLBACK_DATA Data,
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _Flt_CompletionContext_Outptr_ PVOID* CompletionContext) {
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(CompletionContext);
+
+    if (!g_FileProtectionState.Initialized || Data == NULL || Data->Iopb == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    FILE_INFORMATION_CLASS fileInformationClass =
+        Data->Iopb->Parameters.SetFileInformation.FileInformationClass;
+    if (Data->RequestorMode == KernelMode || !IsDangerousSetInformationClass(fileInformationClass)) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+    NTSTATUS status = FltGetFileNameInformation(
+        Data,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+        &nameInfo);
+    if (!NT_SUCCESS(status) || nameInfo == NULL) {
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+    }
+
+    BOOLEAN blockRequest = FALSE;
+    status = FltParseFileNameInformation(nameInfo);
+    if (NT_SUCCESS(status) && IsProtectedDriverPath(&nameInfo->Name)) {
+        blockRequest = TRUE;
+    }
+
+    if (blockRequest) {
+        KdPrint(("[PebMonitor] WARN: Blocking delete/rename set-information access to protected driver file.\n"));
+        FLT_PREOP_CALLBACK_STATUS result = CompleteBlockedProtectedFileRequest(
+            Data,
+            &nameInfo->Name,
+            GetSetInformationClassName(fileInformationClass));
+        FltReleaseFileNameInformation(nameInfo);
+        return result;
     }
 
     FltReleaseFileNameInformation(nameInfo);
