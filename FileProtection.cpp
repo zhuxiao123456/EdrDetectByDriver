@@ -1,7 +1,7 @@
 #include "PebMonitor.h"
 
 static FILE_PROTECTION_STATE g_FileProtectionState = {};
-static const WCHAR g_ProtectedDriverPathSuffixBuffer[] = L"\\Windows\\System32\\drivers\\DriverModule.sys";
+static const WCHAR g_ProtectedDriverOpenPathBuffer[] = L"\\SystemRoot\\System32\\drivers\\DriverModule.sys";
 static const WCHAR g_FileProtectionRuleId[] = L"driver_self_protection";
 
 EXTERN_C PCHAR PsGetProcessImageFileName(_In_ PEPROCESS Process);
@@ -80,6 +80,48 @@ static VOID CopyUnicodeStringToFixedBuffer(
     buffer[copyBytes / sizeof(WCHAR)] = L'\0';
 }
 
+static VOID InitializeUnicodeStringBuffer(
+    _Out_ PUNICODE_STRING target,
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength) {
+    if (target == NULL || buffer == NULL || bufferLength == 0) {
+        return;
+    }
+
+    buffer[0] = L'\0';
+    target->Buffer = buffer;
+    target->Length = 0;
+    target->MaximumLength = (USHORT)(bufferLength * sizeof(WCHAR));
+}
+
+static NTSTATUS CopyUnicodeStringToStateBuffer(
+    _Out_ PUNICODE_STRING target,
+    _Out_writes_(bufferLength) WCHAR* buffer,
+    _In_ SIZE_T bufferLength,
+    _In_ PCUNICODE_STRING source) {
+    if (target == NULL || buffer == NULL || bufferLength == 0 || source == NULL || source->Buffer == NULL) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    InitializeUnicodeStringBuffer(target, buffer, bufferLength);
+
+    ULONG copyBytes = source->Length;
+    ULONG maxBytes = (ULONG)((bufferLength - 1) * sizeof(WCHAR));
+    if (copyBytes > maxBytes) {
+        copyBytes = maxBytes;
+    }
+
+    copyBytes -= (copyBytes % sizeof(WCHAR));
+    if (copyBytes == 0) {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    RtlCopyMemory(buffer, source->Buffer, copyBytes);
+    buffer[copyBytes / sizeof(WCHAR)] = L'\0';
+    target->Length = (USHORT)copyBytes;
+    return STATUS_SUCCESS;
+}
+
 static BOOLEAN IsDangerousCreateRequest(_In_ PFLT_CALLBACK_DATA Data) {
     if (Data == NULL || Data->Iopb == NULL) {
         return FALSE;
@@ -129,32 +171,19 @@ static PCWSTR GetSetInformationClassName(_In_ FILE_INFORMATION_CLASS fileInforma
     }
 }
 
-static BOOLEAN EndsWithUnicodeStringInsensitive(
-    _In_ PCUNICODE_STRING value,
-    _In_ PCUNICODE_STRING suffix) {
-    if (value == NULL || suffix == NULL || value->Buffer == NULL || suffix->Buffer == NULL) {
-        return FALSE;
-    }
-
-    if (value->Length < suffix->Length) {
-        return FALSE;
-    }
-
-    UNICODE_STRING tail = {};
-    tail.Length = suffix->Length;
-    tail.MaximumLength = suffix->Length;
-    tail.Buffer = value->Buffer + ((value->Length - suffix->Length) / sizeof(WCHAR));
-    return RtlEqualUnicodeString(&tail, suffix, TRUE);
-}
-
 static BOOLEAN IsProtectedDriverPath(_In_ PCUNICODE_STRING normalizedName) {
-    if (!g_FileProtectionState.Initialized) {
+    if (!g_FileProtectionState.Initialized ||
+        normalizedName == NULL ||
+        normalizedName->Buffer == NULL ||
+        g_FileProtectionState.CanonicalProtectedDriverPath.Buffer == NULL ||
+        g_FileProtectionState.CanonicalProtectedDriverPath.Length == 0) {
         return FALSE;
     }
 
-    return EndsWithUnicodeStringInsensitive(
+    return RtlEqualUnicodeString(
         normalizedName,
-        &g_FileProtectionState.ProtectedDriverPathSuffix);
+        &g_FileProtectionState.CanonicalProtectedDriverPath,
+        TRUE);
 }
 
 static VOID QueueBlockedFileProtectionEvent(
@@ -204,12 +233,94 @@ static FLT_PREOP_CALLBACK_STATUS CompleteBlockedProtectedFileRequest(
     return FLT_PREOP_COMPLETE;
 }
 
+static NTSTATUS ResolveCanonicalProtectedDriverPath() {
+    if (g_FilterHandle == NULL) {
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+
+    OBJECT_ATTRIBUTES objectAttributes = {};
+    IO_STATUS_BLOCK ioStatus = {};
+    HANDLE fileHandle = NULL;
+    PFILE_OBJECT fileObject = NULL;
+    PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
+
+    InitializeObjectAttributes(
+        &objectAttributes,
+        &g_FileProtectionState.ProtectedDriverOpenPath,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
+        NULL,
+        NULL);
+
+    NTSTATUS status = FltCreateFileEx2(
+        g_FilterHandle,
+        NULL,
+        &fileHandle,
+        &fileObject,
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        &objectAttributes,
+        &ioStatus,
+        NULL,
+        FILE_ATTRIBUTE_NORMAL,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT,
+        NULL,
+        0,
+        0,
+        NULL);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    status = FltGetFileNameInformationUnsafe(
+        fileObject,
+        NULL,
+        FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT,
+        &nameInfo);
+    if (NT_SUCCESS(status)) {
+        status = FltParseFileNameInformation(nameInfo);
+        if (NT_SUCCESS(status)) {
+            status = CopyUnicodeStringToStateBuffer(
+                &g_FileProtectionState.CanonicalProtectedDriverPath,
+                g_FileProtectionState.CanonicalProtectedDriverPathBuffer,
+                RTL_NUMBER_OF(g_FileProtectionState.CanonicalProtectedDriverPathBuffer),
+                &nameInfo->Name);
+        }
+    }
+
+    if (nameInfo != NULL) {
+        FltReleaseFileNameInformation(nameInfo);
+    }
+    if (fileObject != NULL) {
+        ObDereferenceObject(fileObject);
+    }
+    if (fileHandle != NULL) {
+        ZwClose(fileHandle);
+    }
+
+    return status;
+}
+
 NTSTATUS InitializeFileProtectionState() {
     RtlZeroMemory(&g_FileProtectionState, sizeof(g_FileProtectionState));
     RtlInitUnicodeString(
-        &g_FileProtectionState.ProtectedDriverPathSuffix,
-        g_ProtectedDriverPathSuffixBuffer);
+        &g_FileProtectionState.ProtectedDriverOpenPath,
+        g_ProtectedDriverOpenPathBuffer);
+
+    InitializeUnicodeStringBuffer(
+        &g_FileProtectionState.CanonicalProtectedDriverPath,
+        g_FileProtectionState.CanonicalProtectedDriverPathBuffer,
+        RTL_NUMBER_OF(g_FileProtectionState.CanonicalProtectedDriverPathBuffer));
+
+    NTSTATUS status = ResolveCanonicalProtectedDriverPath();
+    if (!NT_SUCCESS(status)) {
+        KdPrint(("[PebMonitor] ERR: Failed to resolve canonical protected-driver path. Status=0x%08X\n", status));
+        return status;
+    }
+
     g_FileProtectionState.Initialized = TRUE;
+    KdPrint(("[PebMonitor] INFO: Canonical protected-driver path resolved: %wZ\n",
+        &g_FileProtectionState.CanonicalProtectedDriverPath));
     return STATUS_SUCCESS;
 }
 

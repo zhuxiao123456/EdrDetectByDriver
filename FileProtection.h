@@ -1,10 +1,13 @@
 #pragma once
 
 #include <fltKernel.h>
+#include "Shared.h"
 
 typedef struct _FILE_PROTECTION_STATE {
     BOOLEAN Initialized;
-    UNICODE_STRING ProtectedDriverPathSuffix;
+    UNICODE_STRING ProtectedDriverOpenPath;
+    UNICODE_STRING CanonicalProtectedDriverPath;
+    WCHAR CanonicalProtectedDriverPathBuffer[MAX_REG_PATH_LENGTH];
 } FILE_PROTECTION_STATE, *PFILE_PROTECTION_STATE;
 
 NTSTATUS InitializeFileProtectionState();

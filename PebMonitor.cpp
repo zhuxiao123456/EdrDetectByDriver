@@ -496,12 +496,6 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
     }
     fastPathInitialized = TRUE;
 
-    status = InitializeFileProtectionState();
-    if (!NT_SUCCESS(status)) {
-        goto Cleanup;
-    }
-    fileProtectionInitialized = TRUE;
-
     ExInitializeRundownProtection(&g_RundownRef);
     rundownProtectionInitialized = TRUE;
 
@@ -533,6 +527,12 @@ extern "C" NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_
         goto Cleanup;
     }
     filterRegistered = TRUE;
+
+    status = InitializeFileProtectionState();
+    if (!NT_SUCCESS(status)) {
+        goto Cleanup;
+    }
+    fileProtectionInitialized = TRUE;
 
     status = FltBuildDefaultSecurityDescriptor(&securityDescriptor, FLT_PORT_ALL_ACCESS);
     if (!NT_SUCCESS(status)) {
